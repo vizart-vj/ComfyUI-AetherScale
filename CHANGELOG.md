@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.5
+
+- Fixed `clean_cache=true` semantics on Windows/ComfyUI execution caching.
+- Replaced clean-cache disk-backed outputs with anonymous/pagefile-backed mappings so completed workflows create no persistent `.mmap` files.
+- Kept `clean_cache=false` as explicit file-backed mmap mode.
+- Preserved PID-aware orphan cleanup for legacy/persistent mmap files.
+- Updated README, package/Registry metadata, User-Agent strings, and release documentation.
+
 ## 0.5.4
 
 - Added `clean_cache` to mmap-backed Super Resolution and Neural Rendering outputs.

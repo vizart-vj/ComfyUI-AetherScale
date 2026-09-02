@@ -35,7 +35,7 @@ The legacy direct backend can bootstrap an MIT bridge/caller from:
 
 A copy of the upstream MIT license is included in `third_party/ComfyUI-DLSS5-NR-LICENSE.txt`.
 
-The same legacy backend contains optional runtime profiles referencing the public `RankFTW/rhi-repo` release catalog. Current pinned archive hashes in AetherScale 0.5.4 are:
+The same legacy backend contains optional runtime profiles referencing the public `RankFTW/rhi-repo` release catalog. Current pinned archive hashes in AetherScale 0.5.5 are:
 
 - RTX 50 / `dlssnr-310.8.0`: `388c0a7912e15ec911b9c9e11a692142b11fe387ddf2b637d8c358138fffb3ac`
 - RTX 40 / `dlssnr-310.8.0-RTX40`: `46124cfaef532ad5f6da07494772ea8c1b3e719f934e254385697f38d1289e3f`

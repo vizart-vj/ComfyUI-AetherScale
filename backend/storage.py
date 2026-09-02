@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import mmap as py_mmap
 import os
 from pathlib import Path
 import threading
@@ -181,8 +182,8 @@ def allocate_cpu_tensor(
 ) -> tuple[torch.Tensor, StorageInfo]:
     global _MMAP_COUNTER
 
-    # Always remove old dead-process leftovers. clean_cache additionally means
-    # every newly-created mmap is delete-on-release rather than persistent.
+    # Always remove old dead-process leftovers. With clean_cache=True, new
+    # large outputs use anonymous mappings and therefore create no cache file.
     cleanup_orphaned_cache()
     cleanup_stale_cache()
 
@@ -200,13 +201,6 @@ def allocate_cpu_tensor(
         t = torch.empty(shape, dtype=dtype, device="cpu")
         return t, StorageInfo("ram", str(dtype).replace("torch.", ""), nbytes, None)
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with _CACHE_LOCK:
-        counter = _MMAP_COUNTER
-        _MMAP_COUNTER += 1
-    stamp = f"{int(time.time()*1000)}_{os.getpid()}_{counter}"
-    path = CACHE_DIR / f"{prefix}_{stamp}.mmap"
-
     np_dtype = {
         torch.float16: np.float16,
         torch.float32: np.float32,
@@ -216,15 +210,40 @@ def allocate_cpu_tensor(
     if np_dtype is None:
         raise ValueError(f"Unsupported mmap dtype: {dtype}")
 
+    # clean_cache=True must not depend on ComfyUI releasing its output cache.
+    # ComfyUI can intentionally retain returned tensors after a workflow has
+    # completed, so a file-backed NumPy memmap would remain visible on disk for
+    # as long as that cached tensor stays alive.  On Windows that live mapping
+    # also prevents reliable unlinking.
+    #
+    # Use an anonymous/pagefile-backed mapping instead. It has the same virtual
+    # memory behaviour required by the streaming writers, but no filesystem
+    # entry exists to leak into .aetherscale_cache.  The mapping is released
+    # naturally with the NumPy/Torch storage.
+    if clean_cache:
+        backing = py_mmap.mmap(-1, nbytes, access=py_mmap.ACCESS_WRITE)
+        arr = np.ndarray(shape=shape, dtype=np_dtype, buffer=backing)
+        t = torch.from_numpy(arr)
+        return t, StorageInfo(
+            "anonymous_mmap",
+            str(dtype).replace("torch.", ""),
+            nbytes,
+            None,
+        )
+
+    # clean_cache=False is the explicit persistent-cache/debug mode. Keep a
+    # normal disk-backed memmap and track its lifetime so stale/dead-process
+    # cleanup remains safe when several ComfyUI processes share this node dir.
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with _CACHE_LOCK:
+        counter = _MMAP_COUNTER
+        _MMAP_COUNTER += 1
+    stamp = f"{int(time.time()*1000)}_{os.getpid()}_{counter}"
+    path = CACHE_DIR / f"{prefix}_{stamp}.mmap"
     mm = np.memmap(path, mode="w+", dtype=np_dtype, shape=shape)
     path_s = str(path)
     with _CACHE_LOCK:
         _ACTIVE_PATHS.add(path_s)
-
-    # torch.from_numpy keeps the NumPy owner alive for the lifetime of the
-    # tensor storage (including downstream views). Finalizing the memmap is
-    # therefore a safe point to remove the file. This fixes the previous
-    # process-lifetime _MMAP_KEEPALIVE behaviour that leaked multi-GB files.
-    weakref.finalize(mm, _on_memmap_release, path_s, bool(clean_cache))
+    weakref.finalize(mm, _on_memmap_release, path_s, False)
     t = torch.from_numpy(mm)
     return t, StorageInfo("mmap", str(dtype).replace("torch.", ""), nbytes, path_s)

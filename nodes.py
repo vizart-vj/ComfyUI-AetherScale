@@ -450,7 +450,7 @@ class AetherScaleDiagnostics:
                 )
 
         payload = {
-            "aetherscale": "0.5.4",
+            "aetherscale": "0.5.5",
             "runtime_ready": state.ready,
             "runtime_version": state.installed_version,
             "required_runtime_version": state.requested_version,

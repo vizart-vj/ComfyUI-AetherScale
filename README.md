@@ -4,20 +4,19 @@
 
 **GPU-native NVIDIA video enhancement, restoration, temporal analysis, and experimental DLSS 5 Neural Rendering for ComfyUI.**
 
-AetherScale is a Windows/NVIDIA-focused custom node suite for high-quality image and video enhancement with practical long-video memory handling. It combines NVIDIA VFX processing, a CUDA-native HDR-style enhancer, temporal motion analysis, mmap-backed storage, and an experimental DLSS 5 carrier backend in one node pack.
+AetherScale is a Windows/NVIDIA-focused custom node suite for high-quality image and video enhancement with practical long-video memory handling. It combines NVIDIA VFX processing, a CUDA-native HDR-style enhancer, temporal motion analysis, memory-mapped long-video storage, and an experimental DLSS 5 carrier backend in one node pack.
 
 **Author:** noise  
-**Current version:** 0.5.4  
+**Current version:** 0.5.5  
 **ComfyUI folder:** `ComfyUI-AetherScale`
 
-## What's new in v0.5.4
+## What's new in v0.5.5
 
-- Added `clean_cache` to **Super Resolution** and **Neural Rendering**.
-- `clean_cache = true` is the default.
-- mmap cache files are removed automatically when ComfyUI releases their tensor storage.
-- Dead-process/orphan mmap files are cleaned with PID-aware checks.
-- Live cache mappings belonging to another running ComfyUI process are preserved.
-- Removed the old process-lifetime memmap keepalive that could leave multi-gigabyte `vsr_*.mmap` files behind.
+- Fixed `clean_cache=true` still leaving `.mmap` files while ComfyUI retained completed workflow outputs.
+- Clean-cache outputs now use anonymous/pagefile-backed mappings, so no `vsr_*.mmap`, `carrier_dlss5_*.mmap`, or `dlssnr_*.mmap` file is created at all.
+- `clean_cache=false` remains the explicit disk-backed mmap mode for debugging or persistent-cache workflows.
+- Dead-process/orphan disk mmap cleanup remains PID-aware and safe across multiple ComfyUI processes.
+- Synchronized README, changelog, package/Registry metadata, runtime User-Agent, and release notes for v0.5.5.
 
 ## Features
 
@@ -25,8 +24,8 @@ AetherScale is a Windows/NVIDIA-focused custom node suite for high-quality image
 - artifact reduction, denoise, and deblur workflows
 - built-in CUDA HDR-style tone/color enhancement
 - streaming, frame-by-frame processing to reduce peak VRAM/RAM pressure
-- mmap-backed output storage for large video batches
-- automatic mmap cache cleanup with an optional `clean_cache` switch
+- anonymous/pagefile-backed clean storage plus optional disk-backed mmap storage for large video batches
+- `clean_cache=true` creates no disk cache file; optional persistent mmap mode remains available
 - temporal motion analysis with scene-cut detection
 - compact FP16 motion storage for long sequences
 - experimental DLSS 5 Neural Rendering carrier backend
@@ -103,14 +102,14 @@ AetherScale avoids moving an entire video batch to CUDA when the operation can b
 
 ### `clean_cache`
 
-`clean_cache` is available on mmap-backed **Super Resolution** and **Neural Rendering** outputs.
+`clean_cache` is available on large-output **Super Resolution** and **Neural Rendering** paths.
 
-- `true` — recommended/default. The backing `.mmap` file is deleted when ComfyUI releases the associated tensor storage.
-- `false` — preserves the backing mmap file after the tensor is released for debugging/manual cache reuse scenarios.
+- `true` — recommended/default. Large outputs use an anonymous/pagefile-backed mapping. There is **no `.mmap` cache file on disk**, even if ComfyUI keeps the finished output tensor in its execution cache.
+- `false` — uses a traditional disk-backed `.mmap` in `.aetherscale_cache` for debugging or workflows where persistent backing storage is specifically desired.
 
-AetherScale also removes orphaned cache files from dead processes while protecting mappings owned by another live ComfyUI process.
+AetherScale still removes orphaned disk mmap files from dead processes while protecting mappings owned by another live ComfyUI process. Old file-backed cache left by earlier AetherScale versions is removed after the old owning ComfyUI process has exited.
 
-This substantially reduces persistent disk usage as well as peak memory pressure, but downstream ComfyUI nodes can still materialize or copy a full IMAGE batch. For extremely long/high-resolution videos, the next node in the workflow must also be memory-conscious.
+This keeps the streaming/low-working-set architecture without accumulating multi-gigabyte cache files during normal `clean_cache=true` use. Downstream ComfyUI nodes can still materialize or copy a full IMAGE batch, so extremely long/high-resolution workflows should remain memory-conscious.
 
 ## HDR backend
 

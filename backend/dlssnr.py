@@ -115,7 +115,7 @@ def _decode_error(buf: ctypes.Array) -> str:
 
 
 def _download(url: str, timeout: int = 90) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.4"})
+    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.5"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -124,7 +124,7 @@ def _download_to_file(url: str, destination: Path, timeout: int = 180) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "ComfyUI-AetherScale/0.5.4"},
+        headers={"User-Agent": "ComfyUI-AetherScale/0.5.5"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp, destination.open("wb") as out:
         while True:

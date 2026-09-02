@@ -85,7 +85,7 @@ def _sha256_file(path: Path) -> str:
 
 def _download(url: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.4"})
+    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.5"})
     with urllib.request.urlopen(req, timeout=240) as resp, path.open("wb") as out:
         while True:
             chunk = resp.read(8 * 1024 * 1024)
