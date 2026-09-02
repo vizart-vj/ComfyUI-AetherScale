@@ -1,6 +1,6 @@
 [project]
 name = "aetherscale"
-version = "0.5.2"
+version = "0.5.3"
 description = "GPU-native NVIDIA video enhancement, restoration, temporal analysis, and experimental DLSS 5 Neural Rendering nodes for ComfyUI."
 authors = [{ name = "noise" }]
 license = { file = "LICENSE" }

@@ -135,3 +135,8 @@ When reporting a Neural Rendering issue, include:
 ## License
 
 MIT License — Copyright (c) 2026 **noise**.
+
+
+## HDR backend
+
+Current NVIDIA Video Effects SDK releases do not expose a public HDR effect. AetherScale therefore uses its built-in CUDA HDR-style enhancer while preserving the existing HDR node controls. If a future NVIDIA VFX runtime exposes a compatible HDR effect, AetherScale can switch to it automatically. The node outputs normalized ComfyUI IMAGE tensors; it does not attach HDR10/PQ mastering metadata.

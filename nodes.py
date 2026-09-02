@@ -301,7 +301,7 @@ class AetherScaleHDR:
     RETURN_NAMES = ("image", "stats")
     FUNCTION = "run"
     CATEGORY = "AetherScale/HDR"
-    DESCRIPTION = "SDR→HDR node. Uses runtime symbol discovery because NVIDIA's exposed HDR class may vary by build."
+    DESCRIPTION = "CUDA HDR-style enhancer with automatic NVIDIA VFX HDR use if a future runtime exposes it."
 
     def run(
         self,
@@ -447,7 +447,7 @@ class AetherScaleDiagnostics:
                 )
 
         payload = {
-            "aetherscale": "0.5.2",
+            "aetherscale": "0.5.3",
             "runtime_ready": state.ready,
             "runtime_version": state.installed_version,
             "required_runtime_version": state.requested_version,

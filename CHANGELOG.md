@@ -1,3 +1,11 @@
+
+## 0.5.3
+
+- Fixed `AetherScaleHDR` on current NVIDIA VFX runtimes.
+- Removed the hard dependency on nonexistent `VideoHDR` / `RTXVideoHDR` Python symbols.
+- Added a CUDA-native, frame-streamed HDR-style enhancer fallback using the existing strength, saturation, contrast, highlight-preservation, and profile controls.
+- Native NVIDIA VFX HDR remains auto-detectable for future SDK releases.
+
 # Changelog
 
 ## 0.5.2

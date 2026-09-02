@@ -405,6 +405,131 @@ def _stream_video_super_res(
         "output_gib":round(storage.bytes/1024**3,3),
     }
 
+
+
+def _hdr_profile_params(profile: str) -> tuple[float, float, float, float]:
+    """Return (shadow_lift, local_contrast, highlight_rolloff, vibrance)."""
+    return {
+        "natural":   (0.025, 0.16, 0.72, 0.10),
+        "balanced":  (0.035, 0.24, 0.82, 0.16),
+        "cinematic": (0.020, 0.32, 0.92, 0.12),
+        "punchy":    (0.045, 0.42, 0.76, 0.24),
+    }.get(str(profile), (0.035, 0.24, 0.82, 0.16))
+
+
+def _aetherscale_hdr_frame(
+    frame_chw: torch.Tensor,
+    *,
+    profile: str,
+    strength: float,
+    saturation: float,
+    contrast: float,
+    highlight_preservation: float,
+) -> torch.Tensor:
+    """High-quality SDR enhancement in linear-ish working space.
+
+    This intentionally stays inside ComfyUI's normalized IMAGE range. It is an
+    HDR-style enhancer/tone mapper, not an HDR10/PQ metadata encoder.
+    """
+    x = frame_chw.float().clamp(0.0, 1.0)
+    s = max(0.0, float(strength))
+    sat = max(0.0, float(saturation))
+    ctr = max(0.0, float(contrast))
+    hp = max(0.0, float(highlight_preservation))
+    shadow_lift, local_contrast, rolloff, vibrance = _hdr_profile_params(profile)
+
+    # Approximate display->linear transform for luminance-aware operations.
+    lin = torch.where(
+        x <= 0.04045,
+        x / 12.92,
+        ((x + 0.055) / 1.055).pow(2.4),
+    )
+    luma = (lin[0:1] * 0.2126 + lin[1:2] * 0.7152 + lin[2:3] * 0.0722).clamp_min(1e-6)
+
+    # Wide, smooth local adaptation. Small fixed kernel keeps memory bounded.
+    base = F.avg_pool2d(luma.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
+    detail = luma - base
+
+    # Lift deep shadows, add controlled local contrast, then compress highlights.
+    lifted = luma + s * shadow_lift * (1.0 - luma).pow(2.0)
+    adapted = lifted + detail * (s * local_contrast * ctr)
+    adapted = adapted.clamp_min(0.0)
+
+    # Shoulder strength increases with preservation: bright detail is compressed
+    # smoothly instead of clipping.
+    shoulder = 1.0 + s * rolloff * (0.35 + 0.65 * hp)
+    mapped_luma = adapted / (adapted + shoulder * (1.0 - adapted).clamp_min(0.0) + 1e-6)
+    mapped_luma = mapped_luma.clamp(0.0, 1.0)
+
+    # Preserve chroma ratios while remapping luminance.
+    ratio = (mapped_luma / luma).clamp(0.0, 8.0)
+    lin = (lin * ratio).clamp(0.0, 1.0)
+
+    # Contrast around perceptual middle grey in linear space.
+    mid = 0.18
+    lin = ((lin - mid) * (1.0 + (ctr - 1.0) * 0.70 * s) + mid).clamp(0.0, 1.0)
+
+    # Luminance-preserving saturation + mild vibrance for low-saturation colors.
+    lum2 = (lin[0:1] * 0.2126 + lin[1:2] * 0.7152 + lin[2:3] * 0.0722)
+    chroma = lin - lum2
+    chroma_mag = chroma.abs().mean(dim=0, keepdim=True)
+    vib_gain = 1.0 + s * vibrance * (1.0 - (chroma_mag * 4.0).clamp(0.0, 1.0))
+    lin = (lum2 + chroma * sat * vib_gain).clamp(0.0, 1.0)
+
+    # Linear->display transfer.
+    out = torch.where(
+        lin <= 0.0031308,
+        lin * 12.92,
+        1.055 * lin.clamp_min(1e-8).pow(1.0 / 2.4) - 0.055,
+    )
+    return out.clamp(0.0, 1.0)
+
+
+def _stream_cuda_hdr(
+    images_bhwc: torch.Tensor,
+    *,
+    config: VFXConfig,
+    memory_policy: str,
+    output_device: str,
+) -> torch.Tensor:
+    src_device = images_bhwc.device
+    cuda_device = torch.device(f"cuda:{config.device}")
+    batch = int(images_bhwc.shape[0])
+    extras = dict(config.extras)
+    profile = extras.get("mode_profile", "balanced")
+    strength = float(extras.get("strength", 0.75))
+    saturation = float(extras.get("saturation", 1.0))
+    contrast = float(extras.get("contrast", 1.0))
+    highlight_preservation = float(extras.get("highlight_preservation", 0.75))
+
+    out_cpu = torch.empty(
+        (batch, config.out_height, config.out_width, 3),
+        dtype=torch.float32,
+        device="cpu",
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    with torch.cuda.device(cuda_device):
+        for i in range(batch):
+            frame = images_bhwc[i, ..., :3].to(
+                device=cuda_device, dtype=torch.float32, non_blocking=False
+            ).permute(2, 0, 1).contiguous()
+            enhanced = _aetherscale_hdr_frame(
+                frame,
+                profile=profile,
+                strength=strength,
+                saturation=saturation,
+                contrast=contrast,
+                highlight_preservation=highlight_preservation,
+            )
+            out_cpu[i].copy_(enhanced.permute(1, 2, 0), non_blocking=False)
+            del enhanced, frame
+            if memory_policy == "aggressive":
+                torch.cuda.empty_cache()
+
+    out_cpu = _append_alpha_if_needed(images_bhwc, out_cpu, config.out_height, config.out_width)
+    return _finalize_output_device(out_cpu, src_device, output_device)
+
 def _stream_video_hdr(
     images_bhwc: torch.Tensor,
     *,
@@ -640,14 +765,29 @@ class VFXBackend:
             device=config.device,
         )
 
-        out = _stream_video_hdr(
-            images_bhwc,
-            config=config,
-            cache_policy=cache_policy,
-            cuda_stream_mode=cuda_stream_mode,
-            memory_policy=memory_policy,
-            output_device=output_device,
-        )
+        nvvfx = _ensure_runtime_module()
+        native_hdr = _find_first_attr(nvvfx, HDR_CLASS_CANDIDATES) is not None
+        if native_hdr:
+            out = _stream_video_hdr(
+                images_bhwc,
+                config=config,
+                cache_policy=cache_policy,
+                cuda_stream_mode=cuda_stream_mode,
+                memory_policy=memory_policy,
+                output_device=output_device,
+            )
+            hdr_engine = "NVIDIA VFX HDR"
+        else:
+            # Current NVIDIA VFX SDK releases do not expose an HDR effect.
+            # Use AetherScale's CUDA-native HDR-style enhancer instead of
+            # failing symbol discovery.
+            out = _stream_cuda_hdr(
+                images_bhwc,
+                config=config,
+                memory_policy=memory_policy,
+                output_device=output_device,
+            )
+            hdr_engine = "AetherScale CUDA HDR"
 
         if memory_policy in ("balanced", "aggressive"):
             gc.collect()
@@ -657,7 +797,9 @@ class VFXBackend:
         final_free, _ = _cuda_memory(config.device)
         elapsed = time.perf_counter() - t0
         stats = {
-            "engine": "NVIDIA VFX HDR",
+            "engine": hdr_engine,
+            "native_nvidia_vfx_hdr_available": native_hdr,
+            "hdr_output_note": "Normalized ComfyUI IMAGE enhancement; not HDR10/PQ metadata encoding",
             "effect_type": config.effect_type,
             "mode": config.mode,
             "quality": config.quality,
