@@ -7,7 +7,7 @@
 AetherScale is a Windows/NVIDIA-focused custom node suite designed for high-quality image and video enhancement with practical long-video memory handling. It combines NVIDIA VFX processing, temporal motion analysis, and an experimental DLSS 5 carrier backend in one node pack.
 
 **Author:** noise  
-**Current version:** 0.5.2  
+**Current version:** 0.5.3  
 **ComfyUI folder:** `ComfyUI-AetherScale`
 
 ## Features
