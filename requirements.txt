@@ -1,0 +1,2 @@
+# Intentionally empty.
+# NVIDIA nvidia-vfx is bootstrapped lazily into ./vendor by the node itself.

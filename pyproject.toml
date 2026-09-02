@@ -1,0 +1,24 @@
+[project]
+name = "aetherscale"
+version = "0.5.2"
+description = "GPU-native NVIDIA video enhancement, restoration, temporal analysis, and experimental DLSS 5 Neural Rendering nodes for ComfyUI."
+authors = [{ name = "noise" }]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/noise/ComfyUI-AetherScale"
+Documentation = "https://github.com/noise/ComfyUI-AetherScale#readme"
+"Bug Tracker" = "https://github.com/noise/ComfyUI-AetherScale/issues"
+
+[tool.comfy]
+PublisherId = "noise"
+DisplayName = "AetherScale"
+Icon = ""
