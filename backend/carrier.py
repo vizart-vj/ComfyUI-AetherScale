@@ -85,7 +85,7 @@ def _sha256_file(path: Path) -> str:
 
 def _download(url: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.4"})
     with urllib.request.urlopen(req, timeout=240) as resp, path.open("wb") as out:
         while True:
             chunk = resp.read(8 * 1024 * 1024)
@@ -440,6 +440,7 @@ def process_carrier(
     auto_bootstrap: bool,
     output_precision: str,
     output_storage: str,
+    clean_cache: bool = True,
     carrier_gpu: str = "windows_high_performance",
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     if not isinstance(images, torch.Tensor) or images.ndim != 4:
@@ -472,6 +473,7 @@ def process_carrier(
         dtype=out_dtype,
         storage_mode=output_storage,
         prefix="carrier_dlss5",
+        clean_cache=bool(clean_cache),
     )
 
     # Carrier is D3D12/DXGI, not CUDA. Pin the worker through Windows'
@@ -672,6 +674,7 @@ def process_carrier(
         "output_precision": storage.dtype,
         "output_storage_backend": storage.backend,
         "output_storage_path": storage.path,
+        "clean_cache": bool(clean_cache),
         "output_gib": round(storage.bytes / 1024**3, 3),
         "worker_log_tail": stderr_lines[-20:],
         "legacy_direct_used": False,

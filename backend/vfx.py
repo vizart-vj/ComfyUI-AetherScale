@@ -335,6 +335,7 @@ def _stream_video_super_res(
     output_device: str,
     output_precision: str = "auto",
     output_storage: str = "auto",
+    clean_cache: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     src_device = images_bhwc.device
     cuda_device = torch.device(f"cuda:{config.device}")
@@ -351,6 +352,7 @@ def _stream_video_super_res(
         dtype=out_dtype,
         storage_mode=output_storage,
         prefix="vsr",
+        clean_cache=bool(clean_cache),
     )
 
     if config.mode == "bicubic":
@@ -645,6 +647,7 @@ class VFXBackend:
         output_device: str,
         output_precision: str = "auto",
         output_storage: str = "auto",
+        clean_cache: bool = True,
     ) -> Tuple[torch.Tensor, dict]:
         if images_bhwc.ndim != 4:
             raise ValueError(
@@ -695,6 +698,7 @@ class VFXBackend:
             output_device=output_device,
             output_precision=output_precision,
             output_storage=output_storage,
+            clean_cache=bool(clean_cache),
         )
 
         if memory_policy in ("balanced", "aggressive"):
@@ -719,6 +723,7 @@ class VFXBackend:
             "zero_copy_dlpack_view": config.mode != "bicubic",
             "cuda_output_clone": False,
             "output_device": str(out.device),
+            "clean_cache": bool(clean_cache),
             "vram_guard": vram_guard,
             "vram_release_reason": release_reason,
             "vram_release_actions": release_actions,

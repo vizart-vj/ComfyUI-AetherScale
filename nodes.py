@@ -124,6 +124,7 @@ class AetherScaleSuperResolution:
         optional = {
             "output_precision": (["auto", "float16", "float32"], {"default": "auto"}),
             "output_storage": (["auto", "mmap", "ram"], {"default": "auto"}),
+            "clean_cache": ("BOOLEAN", {"default": True}),
         }
         return {"required": req, "optional": optional}
 
@@ -154,6 +155,7 @@ class AetherScaleSuperResolution:
         auto_bootstrap: bool,
         output_precision: str = "auto",
         output_storage: str = "auto",
+        clean_cache: bool = True,
     ):
         _ensure_runtime_if_needed(auto_bootstrap, "AetherScale Super Resolution")
         if image.ndim != 4:
@@ -190,6 +192,7 @@ class AetherScaleSuperResolution:
             output_device=output_device,
             output_precision=output_precision,
             output_storage=output_storage,
+            clean_cache=bool(clean_cache),
         )
         return (result, json.dumps(stats, indent=2))
 
@@ -447,7 +450,7 @@ class AetherScaleDiagnostics:
                 )
 
         payload = {
-            "aetherscale": "0.5.3",
+            "aetherscale": "0.5.4",
             "runtime_ready": state.ready,
             "runtime_version": state.installed_version,
             "required_runtime_version": state.requested_version,
@@ -576,6 +579,7 @@ class AetherScaleNeuralRendering:
             "output_storage": (
                 ["auto", "mmap", "ram"], {"default": "auto"},
             ),
+            "clean_cache": ("BOOLEAN", {"default": True}),
             "backend": (
                 ["carrier", "legacy_direct"], {"default": "carrier"},
             ),
@@ -643,6 +647,7 @@ class AetherScaleNeuralRendering:
         temporal_mode_override="legacy_auto",
         output_precision="auto",
         output_storage="auto",
+        clean_cache=True,
         backend="carrier",
         upscale_mode="native_1x",
         motion_source="auto",
@@ -689,6 +694,7 @@ class AetherScaleNeuralRendering:
                 auto_bootstrap=bool(auto_bootstrap),
                 output_precision=output_precision,
                 output_storage=output_storage,
+                clean_cache=bool(clean_cache),
                 carrier_gpu=carrier_gpu,
             )
         else:
@@ -714,6 +720,7 @@ class AetherScaleNeuralRendering:
                 motion=motion,
                 output_precision=output_precision,
                 output_storage=output_storage,
+                clean_cache=bool(clean_cache),
             )
 
         stats["compatibility_contract"] = "AetherScaleNeuralRendering/v0.3-required-schema"

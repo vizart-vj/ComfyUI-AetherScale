@@ -115,7 +115,7 @@ def _decode_error(buf: ctypes.Array) -> str:
 
 
 def _download(url: str, timeout: int = 90) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.4.6"})
+    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.4"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -124,7 +124,7 @@ def _download_to_file(url: str, destination: Path, timeout: int = 180) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "ComfyUI-AetherScale/0.4.6"},
+        headers={"User-Agent": "ComfyUI-AetherScale/0.5.4"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp, destination.open("wb") as out:
         while True:
@@ -932,6 +932,7 @@ def process(
     motion: Optional[Any] = None,
     output_precision: str = "auto",
     output_storage: str = "auto",
+    clean_cache: bool = True,
 ) -> tuple[torch.Tensor, Dict[str, Any]]:
     if not isinstance(images, torch.Tensor) or images.ndim != 4:
         raise DLSSNRError("Expected ComfyUI IMAGE tensor [B,H,W,C].")
@@ -954,7 +955,7 @@ def process(
         input_dtype=images.dtype,
     )
     out_cpu, storage=allocate_cpu_tensor(
-        shape,dtype=out_dtype,storage_mode=output_storage,prefix="dlssnr"
+        shape,dtype=out_dtype,storage_mode=output_storage,prefix="dlssnr",clean_cache=bool(clean_cache)
     )
 
     scene_cuts=[]
@@ -1044,6 +1045,7 @@ def process(
         "output_precision":storage.dtype,
         "output_storage_backend":storage.backend,
         "output_storage_path":storage.path,
+        "clean_cache":bool(clean_cache),
         "output_gib":round(storage.bytes/1024**3,3),
         "per_frame_cpu_staging":True,
         "full_batch_cpu_output_allocation":storage.backend=="ram",

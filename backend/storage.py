@@ -3,15 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Sequence
+import weakref
 
 import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / ".aetherscale_cache"
-_MMAP_KEEPALIVE: list[np.memmap] = []
+_CACHE_LOCK = threading.RLock()
+_ACTIVE_PATHS: set[str] = set()
+_PENDING_DELETE: set[str] = set()
+_MMAP_COUNTER = 0
 
 
 @dataclass(slots=True)
@@ -22,15 +27,114 @@ class StorageInfo:
     path: str | None
 
 
-def cleanup_stale_cache(max_age_hours: float = 48.0) -> None:
+def _pid_from_cache_name(path: Path) -> int | None:
+    # Current cache names are: <prefix>_<timestamp_ms>_<pid>_<counter>.mmap
+    try:
+        parts = path.stem.rsplit("_", 3)
+        if len(parts) != 4:
+            return None
+        return int(parts[-2])
+    except (TypeError, ValueError):
+        return None
+
+
+def _pid_is_alive(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # Windows can report access-related OSErrors for a live foreign process.
+        return True
+    return True
+
+
+def _unlink_with_retry(path: str | Path, retries: int = 4, delay: float = 0.025) -> bool:
+    p = Path(path)
+    for attempt in range(max(1, int(retries))):
+        try:
+            p.unlink(missing_ok=True)
+            return True
+        except PermissionError:
+            if attempt + 1 < retries:
+                time.sleep(delay)
+        except OSError:
+            if attempt + 1 < retries:
+                time.sleep(delay)
+    return not p.exists()
+
+
+def _on_memmap_release(path: str, auto_delete: bool) -> None:
+    with _CACHE_LOCK:
+        _ACTIVE_PATHS.discard(path)
+    if auto_delete:
+        if _unlink_with_retry(path):
+            with _CACHE_LOCK:
+                _PENDING_DELETE.discard(path)
+        else:
+            # A Windows file mapping can remain delete-locked for a very short
+            # period during finalization. Retry on the next cache operation.
+            with _CACHE_LOCK:
+                _PENDING_DELETE.add(path)
+
+
+def _retry_pending_deletes() -> None:
+    with _CACHE_LOCK:
+        pending = list(_PENDING_DELETE)
+    for path in pending:
+        if _unlink_with_retry(path, retries=2):
+            with _CACHE_LOCK:
+                _PENDING_DELETE.discard(path)
+
+
+def cleanup_orphaned_cache() -> int:
+    """Delete mmap files that are not owned by a live AetherScale process.
+
+    This is intentionally PID-aware so two ComfyUI processes sharing the same
+    custom-node folder do not delete each other's live mappings.
+    """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _retry_pending_deletes()
+    removed = 0
+    with _CACHE_LOCK:
+        active = set(_ACTIVE_PATHS)
+    for p in CACHE_DIR.glob("*.mmap"):
+        key = str(p)
+        if key in active:
+            continue
+        owner_pid = _pid_from_cache_name(p)
+        if owner_pid is not None and _pid_is_alive(owner_pid):
+            continue
+        if _unlink_with_retry(p):
+            removed += 1
+    return removed
+
+
+def cleanup_stale_cache(max_age_hours: float = 48.0) -> int:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _retry_pending_deletes()
     cutoff = time.time() - max_age_hours * 3600.0
+    removed = 0
+    with _CACHE_LOCK:
+        active = set(_ACTIVE_PATHS)
     for p in CACHE_DIR.glob("*.mmap"):
         try:
-            if p.stat().st_mtime < cutoff:
-                p.unlink()
+            if str(p) in active:
+                continue
+            owner_pid = _pid_from_cache_name(p)
+            if owner_pid is not None and _pid_is_alive(owner_pid):
+                continue
+            if p.stat().st_mtime < cutoff and _unlink_with_retry(p):
+                removed += 1
         except OSError:
             pass
+    return removed
 
 
 def resolve_dtype(
@@ -73,8 +177,15 @@ def allocate_cpu_tensor(
     storage_mode: str = "auto",
     prefix: str = "output",
     mmap_threshold_mb: int = 768,
+    clean_cache: bool = True,
 ) -> tuple[torch.Tensor, StorageInfo]:
+    global _MMAP_COUNTER
+
+    # Always remove old dead-process leftovers. clean_cache additionally means
+    # every newly-created mmap is delete-on-release rather than persistent.
+    cleanup_orphaned_cache()
     cleanup_stale_cache()
+
     shape = tuple(int(x) for x in shape)
     nbytes = estimate_bytes(shape, dtype)
     threshold = int(mmap_threshold_mb) * 1024 * 1024
@@ -90,7 +201,10 @@ def allocate_cpu_tensor(
         return t, StorageInfo("ram", str(dtype).replace("torch.", ""), nbytes, None)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = f"{int(time.time()*1000)}_{os.getpid()}_{len(_MMAP_KEEPALIVE)}"
+    with _CACHE_LOCK:
+        counter = _MMAP_COUNTER
+        _MMAP_COUNTER += 1
+    stamp = f"{int(time.time()*1000)}_{os.getpid()}_{counter}"
     path = CACHE_DIR / f"{prefix}_{stamp}.mmap"
 
     np_dtype = {
@@ -103,6 +217,14 @@ def allocate_cpu_tensor(
         raise ValueError(f"Unsupported mmap dtype: {dtype}")
 
     mm = np.memmap(path, mode="w+", dtype=np_dtype, shape=shape)
-    _MMAP_KEEPALIVE.append(mm)
+    path_s = str(path)
+    with _CACHE_LOCK:
+        _ACTIVE_PATHS.add(path_s)
+
+    # torch.from_numpy keeps the NumPy owner alive for the lifetime of the
+    # tensor storage (including downstream views). Finalizing the memmap is
+    # therefore a safe point to remove the file. This fixes the previous
+    # process-lifetime _MMAP_KEEPALIVE behaviour that leaked multi-GB files.
+    weakref.finalize(mm, _on_memmap_release, path_s, bool(clean_cache))
     t = torch.from_numpy(mm)
-    return t, StorageInfo("mmap", str(dtype).replace("torch.", ""), nbytes, str(path))
+    return t, StorageInfo("mmap", str(dtype).replace("torch.", ""), nbytes, path_s)

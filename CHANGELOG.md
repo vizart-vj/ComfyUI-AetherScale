@@ -1,3 +1,13 @@
+# Changelog
+
+## 0.5.4
+
+- Added `clean_cache` to mmap-backed Super Resolution and Neural Rendering outputs.
+- Automatically removes mmap cache files when ComfyUI releases their tensor storage.
+- Cleans orphaned files from dead processes while protecting live mappings.
+- Removed the old process-lifetime memmap keepalive that caused large cache files to accumulate.
+- Synchronized README, Registry/package metadata, runtime User-Agent, author/publisher identity, and third-party notices for the v0.5.4 release.
+
 
 ## 0.5.3
 
@@ -5,8 +15,6 @@
 - Removed the hard dependency on nonexistent `VideoHDR` / `RTXVideoHDR` Python symbols.
 - Added a CUDA-native, frame-streamed HDR-style enhancer fallback using the existing strength, saturation, contrast, highlight-preservation, and profile controls.
 - Native NVIDIA VFX HDR remains auto-detectable for future SDK releases.
-
-# Changelog
 
 ## 0.5.2
 
