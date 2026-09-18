@@ -13,7 +13,6 @@ import shutil
 import subprocess
 import threading
 import tempfile
-import urllib.request
 import zipfile
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -21,7 +20,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
-from .storage import allocate_cpu_tensor, resolve_dtype
+from .storage import allocate_cpu_tensor, resolve_dtype, sync_file_backed_tensor
+from .progress import ConsoleProgress
+from .download import download_bytes, download_file
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,23 +116,20 @@ def _decode_error(buf: ctypes.Array) -> str:
 
 
 def _download(url: str, timeout: int = 90) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.5"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    return download_bytes(
+        url,
+        user_agent="ComfyUI-AetherScale/0.9.2",
+        timeout=timeout,
+    )
 
 
 def _download_to_file(url: str, destination: Path, timeout: int = 180) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(
+    download_file(
         url,
-        headers={"User-Agent": "ComfyUI-AetherScale/0.5.5"},
+        destination,
+        user_agent="ComfyUI-AetherScale/0.9.2",
+        timeout=timeout,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp, destination.open("wb") as out:
-        while True:
-            chunk = resp.read(8 * 1024 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
 
 
 def _gpu_generation(gpu_index: int = 0) -> str:
@@ -965,6 +963,7 @@ def process(
 
     # Working set is bounded to one frame:
     # input frame float32 + native D3D12 resources + output frame float32.
+    console_progress = ConsoleProgress("Neural Rendering / legacy direct", batch, unit="frame")
     with _lock:
         lib=_ensure_initialized(int(gpu_index),runtime_path,bool(auto_bootstrap))
         for i in range(batch):
@@ -1005,16 +1004,21 @@ def process(
                         "this is not a VRAM, image-size, or caller-shim failure."
                     )
                 raise DLSSNRError(f"Frame {i}: {native_error}")
-            corrected=np.ascontiguousarray(_channel_correct(frame_out,frame_in,channel_order))
+            corrected=np.ascontiguousarray(np.clip(_channel_correct(frame_out,frame_in,channel_order), 0.0, 1.0))
             out_cpu[i,...,:3].copy_(torch.from_numpy(corrected).to(dtype=out_dtype))
             if channels==4:
                 # No full-batch alpha clone.
                 out_cpu[i,...,3:4].copy_(
-                    images[i,...,3:4].detach().to(device="cpu",dtype=out_dtype)
+                    images[i,...,3:4].detach().to(device="cpu",dtype=out_dtype).clamp_(0,1)
                 )
+            sync_file_backed_tensor(
+                out_cpu,
+                bytes_written=out_cpu[i].numel() * out_cpu.element_size(),
+            )
+            console_progress.update(1)
             del frame_t,frame_in,frame_out,corrected
 
-    out_cpu.clamp_(0,1)
+    sync_file_backed_tensor(out_cpu, force=True)
     if output_device=="same_as_input" and images.device.type!="cpu":
         result=out_cpu.to(images.device,non_blocking=False)
     else:
@@ -1045,6 +1049,15 @@ def process(
         "output_precision":storage.dtype,
         "output_storage_backend":storage.backend,
         "output_storage_path":storage.path,
+        "output_storage_fallback_reason":storage.fallback_reason,
+        "system_commit_available_gib_at_allocation": (
+            round(storage.commit_available_bytes / 1024**3, 3)
+            if storage.commit_available_bytes is not None else None
+        ),
+        "spill_disk_free_gib_at_allocation": (
+            round(storage.disk_free_bytes / 1024**3, 3)
+            if storage.disk_free_bytes is not None else None
+        ),
         "clean_cache":bool(clean_cache),
         "output_gib":round(storage.bytes/1024**3,3),
         "per_frame_cpu_staging":True,

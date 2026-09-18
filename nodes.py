@@ -11,6 +11,17 @@ from .backend.runtime import RuntimeManager
 from .backend.vfx import VFXBackend, VFXConfig, resolve_output_size
 from .backend.neural import MotionPacket, analyze_motion, flow_visualization, neural_vram_plan
 from .backend.carrier import process_carrier, ensure_carrier, CarrierError, carrier_gpu_choices
+from .backend.mfg import generate_mfg_lab, encode_mfg_video
+from .backend.combine import encode_video_batch, video_gpu_choices
+from .backend.video_loader import list_input_videos, load_video_low_ram, resolve_video_path
+from .backend.progress import console_node
+from .backend.nr_interop import (
+    NativeNRInteropError,
+    ensure_native_bundle,
+    process_native_interop,
+    runtime_info as native_nr_runtime_info,
+    shutdown as shutdown_native_nr,
+)
 from .backend.dlssnr import (
     DLSSNRError, ensure_bridge as ensure_dlss5_bridge, probe as probe_dlss5,
     process as process_dlss5, runtime_info as dlss5_runtime_info, shutdown as shutdown_dlss5,
@@ -298,7 +309,14 @@ class AetherScaleHDR:
             ),
         }
         req.update(_common_runtime_inputs())
-        return {"required": req}
+        return {
+            "required": req,
+            "optional": {
+                "output_precision": (["auto", "float16", "float32"], {"default": "auto"}),
+                "output_storage": (["auto", "mmap", "ram"], {"default": "auto"}),
+                "clean_cache": ("BOOLEAN", {"default": True}),
+            },
+        }
 
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("image", "stats")
@@ -323,6 +341,9 @@ class AetherScaleHDR:
         min_free_vram_mb: int,
         output_device: str,
         auto_bootstrap: bool,
+        output_precision: str = "auto",
+        output_storage: str = "auto",
+        clean_cache: bool = True,
     ):
         _ensure_runtime_if_needed(auto_bootstrap, "AetherScale HDR")
         if image.ndim != 4:
@@ -358,6 +379,9 @@ class AetherScaleHDR:
             vram_guard=vram_guard,
             min_free_vram_mb=int(min_free_vram_mb),
             output_device=output_device,
+            output_precision=str(output_precision),
+            output_storage=str(output_storage),
+            clean_cache=bool(clean_cache),
         )
         return (result, json.dumps(stats, indent=2))
 
@@ -368,7 +392,7 @@ class AetherScaleRuntime:
         return {
             "required": {
                 "action": (
-                    ["status", "install_or_update", "repair", "clear_effect_cache", "install_dlss5_bridge", "shutdown_dlss5", "clear_runtime"],
+                    ["status", "install_or_update", "repair", "clear_effect_cache", "install_native_nr", "shutdown_native_nr", "install_dlss5_bridge", "shutdown_dlss5", "clear_runtime"],
                     {"default": "status"},
                 ),
             }
@@ -388,6 +412,12 @@ class AetherScaleRuntime:
             state = RuntimeManager.ensure(force_reinstall=True)
         elif action == "clear_effect_cache":
             VFXBackend.clear_effect_cache()
+            state = RuntimeManager.probe()
+        elif action == "install_native_nr":
+            ensure_native_bundle(auto_bootstrap=True, gpu_index=0)
+            state = RuntimeManager.probe()
+        elif action == "shutdown_native_nr":
+            shutdown_native_nr()
             state = RuntimeManager.probe()
         elif action == "install_dlss5_bridge":
             ensure_dlss5_bridge(force=False)
@@ -419,10 +449,467 @@ class AetherScaleRuntime:
             "gpu": _driver_info(),
             "effect_cache_entries": VFXBackend.effect_cache_size(),
             "capabilities": VFXBackend.available_capabilities(),
-            "neural_rendering": dlss5_runtime_info(),
+            "neural_rendering": {
+                "native_interop": native_nr_runtime_info(),
+                "legacy_direct": dlss5_runtime_info(),
+            },
         }
         return (json.dumps(info, indent=2),)
 
+
+
+
+class AetherScaleMFGLab:
+    @classmethod
+    def INPUT_TYPES(cls):
+        device_max = max(0, torch.cuda.device_count() - 1) if torch.cuda.is_available() else 0
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mode": (
+                    ["native_dlssg", "surrogate_mv", "probe_only"],
+                    {"default": "native_dlssg"},
+                ),
+                "multiplier": (
+                    ["2x", "3x", "4x", "5x", "6x"],
+                    {"default": "4x"},
+                ),
+                "motion_source": (
+                    ["internal_dis", "connected_motion", "internal_compact", "rgb_only"],
+                    {"default": "internal_dis"},
+                ),
+                "surrogate_method": (
+                    ["mv_blend", "linear_blend", "frame_repeat"],
+                    {"default": "mv_blend"},
+                ),
+                "scene_cut_strategy": (
+                    ["repeat_previous", "repeat_current", "linear_blend"],
+                    {"default": "repeat_previous"},
+                ),
+                "cuda_device": (
+                    "INT", {"default": 0, "min": 0, "max": device_max, "step": 1},
+                ),
+                "output_device": (
+                    ["cpu_safe", "same_as_input"], {"default": "cpu_safe"},
+                ),
+            },
+            "optional": {
+                "motion": ("AETHERSCALE_MOTION",),
+                "output_precision": (
+                    ["auto", "float16", "float32"], {"default": "auto"},
+                ),
+                "output_storage": (
+                    ["auto", "mmap", "ram"], {"default": "auto"},
+                ),
+                "clean_cache": ("BOOLEAN", {"default": True}),
+                "artifact_guard": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "emissive_protection": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "thin_detail_protection": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "mv_confidence_threshold": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "fallback_mode": (["linear_blend", "closest_source"], {"default": "linear_blend"}),
+                "synthesis_mode": (["continuous_temporal", "legacy_guarded"], {"default": "continuous_temporal"}),
+                "source_frame_rate": ("FLOAT", {"default": 24.0, "min": 0.01, "max": 240.0, "step": 0.01}),
+                "native_auto_bootstrap": ("BOOLEAN", {"default": True}),
+                "native_guide_source": (["internal_dis", "connected_motion", "zero_motion"], {"default": "internal_dis"}),
+                "native_scene_cut_threshold": ("FLOAT", {"default": 0.24, "min": 0.01, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "stats")
+    FUNCTION = "run"
+    CATEGORY = "AetherScale/MFG"
+    DESCRIPTION = (
+        "Native NVIDIA DLSS Frame Generation for ComfyUI IMAGE sequences. "
+        "Uses a D3D12 DLSSG worker and DIS motion guides; the previous surrogate remains available as a fallback/debug backend."
+    )
+
+    def run(
+        self,
+        images,
+        mode,
+        multiplier,
+        motion_source,
+        surrogate_method,
+        scene_cut_strategy,
+        cuda_device,
+        output_device,
+        motion=None,
+        output_precision="auto",
+        output_storage="auto",
+        clean_cache=True,
+        artifact_guard=1.0,
+        emissive_protection=0.85,
+        thin_detail_protection=0.75,
+        mv_confidence_threshold=0.45,
+        fallback_mode="linear_blend",
+        synthesis_mode="continuous_temporal",
+        source_frame_rate=24.0,
+        native_auto_bootstrap=True,
+        native_guide_source="internal_dis",
+        native_scene_cut_threshold=0.24,
+    ):
+        multiplier_int = {"2x": 2, "3x": 3, "4x": 4, "5x": 5, "6x": 6}[str(multiplier)]
+        resolved_motion = None if motion_source == "rgb_only" else motion
+        result, stats = generate_mfg_lab(
+            images,
+            motion=resolved_motion,
+            mode=str(mode),
+            motion_source=str(motion_source),
+            multiplier=int(multiplier_int),
+            surrogate_method=str(surrogate_method),
+            scene_cut_strategy=str(scene_cut_strategy),
+            cuda_device=int(cuda_device),
+            output_device=str(output_device),
+            output_precision=str(output_precision),
+            output_storage=str(output_storage),
+            clean_cache=bool(clean_cache),
+            artifact_guard=float(artifact_guard),
+            emissive_protection=float(emissive_protection),
+            thin_detail_protection=float(thin_detail_protection),
+            mv_confidence_threshold=float(mv_confidence_threshold),
+            fallback_mode=str(fallback_mode),
+            synthesis_mode=str(synthesis_mode),
+            source_frame_rate=float(source_frame_rate),
+            native_auto_bootstrap=bool(native_auto_bootstrap),
+            native_guide_source=str(native_guide_source),
+            native_scene_cut_threshold=float(native_scene_cut_threshold),
+        )
+        return (result, json.dumps(stats, indent=2))
+
+
+
+class AetherScaleMFGVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        device_max = max(0, torch.cuda.device_count() - 1) if torch.cuda.is_available() else 0
+        gpu_choices, gpu_default = video_gpu_choices()
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "source_frame_rate": (
+                    "FLOAT", {"default": 24.0, "min": 0.01, "max": 240.0, "step": 0.01},
+                ),
+                "multiplier": (
+                    ["2x", "3x", "4x", "5x", "6x"], {"default": "4x"},
+                ),
+                "motion_source": (
+                    ["internal_dis", "connected_motion", "internal_compact", "rgb_only"],
+                    {"default": "internal_dis"},
+                ),
+                "surrogate_method": (
+                    ["mv_blend", "linear_blend", "frame_repeat"], {"default": "mv_blend"},
+                ),
+                "scene_cut_strategy": (
+                    ["repeat_previous", "repeat_current", "linear_blend"],
+                    {"default": "repeat_previous"},
+                ),
+                "codec": (
+                    ["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264", "prores_proxy", "prores_lt", "prores_standard", "prores_hq", "prores_4444", "prores_4444_xq"],
+                    {"default": "h264_nvenc"},
+                ),
+                "preset": (
+                    ["p1", "p2", "p3", "p4", "p5", "p6", "p7"], {"default": "p4"},
+                ),
+                "bitrate_mbps": (
+                    "INT", {"default": 16, "min": 1, "max": 500, "step": 1},
+                ),
+                "pixel_format": (
+                    ["yuv420p", "yuv444p"], {"default": "yuv420p"},
+                ),
+                "filename_prefix": (
+                    "STRING", {"default": "AetherScale/MFG", "multiline": False},
+                ),
+                "cuda_device": (
+                    "INT", {"default": 0, "min": 0, "max": device_max, "step": 1},
+                ),
+            },
+            "optional": {
+                "motion": ("AETHERSCALE_MOTION",),
+                "artifact_guard": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "emissive_protection": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "thin_detail_protection": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "mv_confidence_threshold": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "fallback_mode": (["linear_blend", "closest_source"], {"default": "linear_blend"}),
+                "synthesis_mode": (["continuous_temporal", "legacy_guarded"], {"default": "continuous_temporal"}),
+                "backend": (["native_dlssg", "surrogate_mv"], {"default": "native_dlssg"}),
+                "native_auto_bootstrap": ("BOOLEAN", {"default": True}),
+                "native_guide_source": (["internal_dis", "connected_motion", "zero_motion"], {"default": "internal_dis"}),
+                "native_scene_cut_threshold": ("FLOAT", {"default": 0.24, "min": 0.01, "max": 1.0, "step": 0.01}),
+                "nvenc_gpu": (gpu_choices, {"default": gpu_default}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("video_path", "stats")
+    FUNCTION = "run"
+    CATEGORY = "AetherScale/MFG"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Native NVIDIA DLSS Frame Generation streamed directly into FFmpeg/NVENC. "
+        "No full multiplied IMAGE batch is materialized; the legacy surrogate remains selectable for comparison."
+    )
+
+    def run(
+        self,
+        images,
+        source_frame_rate,
+        multiplier,
+        motion_source,
+        surrogate_method,
+        scene_cut_strategy,
+        codec,
+        preset,
+        bitrate_mbps,
+        pixel_format,
+        filename_prefix,
+        cuda_device,
+        motion=None,
+        artifact_guard=1.0,
+        emissive_protection=0.85,
+        thin_detail_protection=0.75,
+        mv_confidence_threshold=0.45,
+        fallback_mode="linear_blend",
+        synthesis_mode="continuous_temporal",
+        backend="native_dlssg",
+        native_auto_bootstrap=True,
+        native_guide_source="internal_dis",
+        native_scene_cut_threshold=0.24,
+        nvenc_gpu="auto",
+    ):
+        multiplier_int = {"2x": 2, "3x": 3, "4x": 4, "5x": 5, "6x": 6}[str(multiplier)]
+        resolved_motion = None if motion_source == "rgb_only" else motion
+        stats = encode_mfg_video(
+            images,
+            motion=resolved_motion,
+            source_frame_rate=float(source_frame_rate),
+            multiplier=int(multiplier_int),
+            motion_source=str(motion_source),
+            surrogate_method=str(surrogate_method),
+            scene_cut_strategy=str(scene_cut_strategy),
+            cuda_device=int(cuda_device),
+            codec=str(codec),
+            preset=str(preset),
+            bitrate_mbps=int(bitrate_mbps),
+            filename_prefix=str(filename_prefix),
+            pixel_format=str(pixel_format),
+            artifact_guard=float(artifact_guard),
+            emissive_protection=float(emissive_protection),
+            thin_detail_protection=float(thin_detail_protection),
+            mv_confidence_threshold=float(mv_confidence_threshold),
+            fallback_mode=str(fallback_mode),
+            synthesis_mode=str(synthesis_mode),
+            backend=str(backend),
+            native_auto_bootstrap=bool(native_auto_bootstrap),
+            native_guide_source=str(native_guide_source),
+            native_scene_cut_threshold=float(native_scene_cut_threshold),
+            nvenc_gpu=str(nvenc_gpu),
+        )
+        return (str(stats["output_path"]), json.dumps(stats, indent=2))
+
+
+
+
+class AetherScaleVideoLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": (list_input_videos(),),
+                "force_rate": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 0.01}),
+                "start_time": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01}),
+                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": 1000000, "step": 1}),
+                "precision": (["auto", "float16", "float32"], {"default": "auto"}),
+                "decode_chunk_frames": ("INT", {"default": 4, "min": 1, "max": 32, "step": 1}),
+                "load_audio": ("BOOLEAN", {"default": True}),
+                "clean_cache": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "path_override": ("STRING", {"default": "", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "AUDIO", "VHS_VIDEOINFO", "FLOAT", "STRING")
+    RETURN_NAMES = ("images", "frame_count", "audio", "video_info", "frame_rate", "stats")
+    FUNCTION = "run"
+    CATEGORY = "AetherScale/IO"
+    DESCRIPTION = (
+        "Low-RAM FFmpeg video loader. Decodes small chunks and writes them sequentially "
+        "to an FP16/FP32 file-backed IMAGE tensor instead of materializing the whole video "
+        "as a giant float32 RAM batch."
+    )
+
+    @classmethod
+    def IS_CHANGED(cls, video, path_override="", **kwargs):
+        try:
+            path = resolve_video_path(video, path_override)
+            st = path.stat()
+            return f"{path}:{st.st_size}:{st.st_mtime_ns}"
+        except Exception:
+            return float("nan")
+
+    def run(
+        self,
+        video,
+        force_rate,
+        start_time,
+        frame_load_cap,
+        precision,
+        decode_chunk_frames,
+        load_audio,
+        clean_cache,
+        path_override="",
+    ):
+        return load_video_low_ram(
+            video=str(video),
+            path_override=str(path_override),
+            force_rate=float(force_rate),
+            start_time=float(start_time),
+            frame_load_cap=int(frame_load_cap),
+            precision=str(precision),
+            decode_chunk_frames=int(decode_chunk_frames),
+            load_audio=bool(load_audio),
+            clean_cache=bool(clean_cache),
+        )
+
+class AetherScaleVideoCombine:
+    @classmethod
+    def INPUT_TYPES(cls):
+        gpu_choices, gpu_default = video_gpu_choices()
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "frame_rate": (
+                    "FLOAT", {"default": 24.0, "min": 0.01, "max": 1000.0, "step": 0.01},
+                ),
+                "filename_prefix": (
+                    "STRING", {"default": "AetherScale/%date:yyyy-MM-dd%/AetherScale", "multiline": False},
+                ),
+                "container": (["mp4", "mkv", "mov"], {"default": "mp4"}),
+                "codec": (
+                    ["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264", "prores_proxy", "prores_lt", "prores_standard", "prores_hq", "prores_4444", "prores_4444_xq"],
+                    {"default": "h264_nvenc"},
+                ),
+                "preset": (
+                    ["p1", "p2", "p3", "p4", "p5", "p6", "p7"], {"default": "p3"},
+                ),
+                "nvenc_gpu": (gpu_choices, {"default": gpu_default}),
+                "bitrate_mbps": (
+                    "INT", {"default": 20, "min": 1, "max": 1000, "step": 1},
+                ),
+                "pixel_format": (
+                    ["yuv420p", "yuv444p"], {"default": "yuv420p"},
+                ),
+                "save_output": ("BOOLEAN", {"default": True}),
+                "chunk_mb": (
+                    "INT", {"default": 64, "min": 8, "max": 512, "step": 8},
+                ),
+                "pipeline_depth": (
+                    "INT", {"default": 2, "min": 1, "max": 4, "step": 1},
+                ),
+            },
+            "optional": {
+                "audio": ("AUDIO",),
+                "audio_bitrate_kbps": (
+                    ["64 kbps", "96 kbps", "128 kbps", "160 kbps", "192 kbps", "256 kbps", "320 kbps", "384 kbps", "448 kbps", "512 kbps"],
+                    {"default": "192 kbps"},
+                ),
+                "nvenc_codec_fallback": ("BOOLEAN", {"default": True}),
+                "save_silent_copy": ("BOOLEAN", {"default": False}),
+                "save_metadata": ("BOOLEAN", {"default": True}),
+                "metadata_target": (
+                    ["sidecar_json", "video_container", "both"],
+                    {"default": "sidecar_json"},
+                ),
+                "seed": (
+                    "INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff, "step": 1},
+                ),
+                "sampler_name": (
+                    "STRING", {"default": "", "multiline": False},
+                ),
+                "scheduler": (
+                    "STRING", {"default": "", "multiline": False},
+                ),
+                "model_name": (
+                    "STRING", {"default": "", "multiline": False},
+                ),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("video_path", "stats")
+    FUNCTION = "run"
+    CATEGORY = "AetherScale/Output"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "High-throughput IMAGE-to-video encoder with inline preview, generation metadata (seed/sampler/scheduler/model), "
+        "audio/silent-copy policy, chunked packing, bounded pipelining, NVENC, and high-depth ProRes/MOV output."
+    )
+
+    def run(
+        self,
+        images,
+        frame_rate,
+        filename_prefix,
+        container,
+        codec,
+        preset,
+        nvenc_gpu,
+        bitrate_mbps,
+        pixel_format,
+        save_output,
+        chunk_mb,
+        pipeline_depth,
+        audio=None,
+        audio_bitrate_kbps="192 kbps",
+        nvenc_codec_fallback=True,
+        save_silent_copy=False,
+        save_metadata=True,
+        metadata_target="sidecar_json",
+        seed=-1,
+        sampler_name="",
+        scheduler="",
+        model_name="",
+        prompt=None,
+        extra_pnginfo=None,
+        unique_id=None,
+    ):
+        stats = encode_video_batch(
+            images,
+            frame_rate=float(frame_rate),
+            filename_prefix=str(filename_prefix),
+            container=str(container),
+            codec=str(codec),
+            preset=str(preset),
+            nvenc_gpu=str(nvenc_gpu),
+            bitrate_mbps=int(bitrate_mbps),
+            pixel_format=str(pixel_format),
+            audio=audio,
+            audio_bitrate_kbps=audio_bitrate_kbps,
+            nvenc_codec_fallback=bool(nvenc_codec_fallback),
+            save_output=bool(save_output),
+            chunk_mb=int(chunk_mb),
+            pipeline_depth=int(pipeline_depth),
+            save_silent_copy=bool(save_silent_copy),
+            save_metadata=bool(save_metadata),
+            metadata_target=str(metadata_target),
+            prompt=prompt,
+            extra_pnginfo=extra_pnginfo,
+            unique_id=unique_id,
+            generation_seed=int(seed),
+            generation_sampler=str(sampler_name),
+            generation_scheduler=str(scheduler),
+            generation_model=str(model_name),
+        )
+        result = (str(stats["output_path"]), json.dumps(stats, indent=2))
+        preview = stats.get("preview")
+        ui = {"gifs": [preview]} if isinstance(preview, dict) else {}
+        return {"ui": ui, "result": result}
 
 class AetherScaleDiagnostics:
     @classmethod
@@ -450,7 +937,7 @@ class AetherScaleDiagnostics:
                 )
 
         payload = {
-            "aetherscale": "0.5.5",
+            "aetherscale": "0.9.2",
             "runtime_ready": state.ready,
             "runtime_version": state.installed_version,
             "required_runtime_version": state.requested_version,
@@ -460,7 +947,10 @@ class AetherScaleDiagnostics:
             "devices": devices,
             "effect_cache_entries": VFXBackend.effect_cache_size(),
             "capabilities": VFXBackend.available_capabilities(),
-            "neural_rendering": dlss5_runtime_info(),
+            "neural_rendering": {
+                "native_interop": native_nr_runtime_info(),
+                "legacy_direct": dlss5_runtime_info(),
+            },
             "nodes": [
                 "AetherScale • Super Resolution",
                 "AetherScale • Restoration",
@@ -470,11 +960,20 @@ class AetherScaleDiagnostics:
                 "AetherScale • Neural VRAM Planner",
                 "AetherScale • Runtime",
                 "AetherScale • Diagnostics",
+                "AetherScale • MFG",
+                "AetherScale • MFG Video",
+                "AetherScale • Video Loader",
+                "AetherScale • Video Combine",
             ],
             "notes": [
                 "Super Resolution groups upscale-oriented modes.",
+                "Low-RAM Video Loader decodes sequentially into a file-backed IMAGE tensor to avoid whole-video float32 RAM spikes.",
                 "Restoration groups same-resolution cleanup modes to avoid node spam.",
                 "HDR binding is adaptive because NVIDIA's exposed class names may vary by runtime build.",
+                "Neural Rendering now defaults to an in-process native_interop backend with CUDA/D3D12 interop and bounded chunk scheduling.",
+                "The NR bridge/caller are declared third-party MIT dependencies; AetherScale owns the adapter, GPU matching, storage, interrupt, and fallback layers.",
+                "MFG now defaults to a native D3D12 DLSS Frame Generation backend; the legacy surrogate remains available for fallback/debug.",
+                "Legacy surrogate MFG controls remain available for reproducing pre-v0.8 workflows; native DLSSG ignores those artifact-guard controls.",
             ],
         }
         return (json.dumps(payload, indent=2),)
@@ -489,7 +988,7 @@ class AetherScaleMotionAnalysis:
         required = {
             "images": ("IMAGE",),
             "engine": (["auto","torch_lk","nvidia_optical_flow"], {"default":"auto"}),
-            "quality": (["balanced","quality","fast"], {"default":"balanced"}),
+            "quality": (["mfg_safe","fast","balanced","quality"], {"default":"mfg_safe"}),
             "scene_cut_threshold": ("FLOAT", {"default":0.22,"min":0.01,"max":1.0,"step":0.01}),
             "reset_on_scene_cut": ("BOOLEAN", {"default":True}),
             "cuda_device": ("INT", {"default":0,"min":0,"max":device_max,"step":1}),
@@ -581,7 +1080,7 @@ class AetherScaleNeuralRendering:
             ),
             "clean_cache": ("BOOLEAN", {"default": True}),
             "backend": (
-                ["carrier", "legacy_direct"], {"default": "carrier"},
+                ["native_interop", "carrier", "legacy_direct"], {"default": "native_interop"},
             ),
             "upscale_mode": (
                 ["native_1x", "quality_1_5x", "balanced_1_724x", "performance_2x", "ultra_performance_3x"],
@@ -601,6 +1100,15 @@ class AetherScaleNeuralRendering:
                 carrier_gpu_choices(),
                 {"default": "windows_high_performance"},
             ),
+            "native_chunk_frames": (
+                "INT", {"default": 8, "min": 1, "max": 128, "step": 1},
+            ),
+            "native_scene_change_threshold": (
+                "FLOAT", {"default": 0.24, "min": 0.01, "max": 1.0, "step": 0.01},
+            ),
+            "native_fallback": (
+                ["carrier", "legacy_direct", "error"], {"default": "carrier"},
+            ),
         }
         return {"required": req, "optional": optional}
 
@@ -609,8 +1117,8 @@ class AetherScaleNeuralRendering:
     FUNCTION = "run"
     CATEGORY = "AetherScale/Neural"
     DESCRIPTION = (
-        "DLSS 5 Neural Rendering using carrier DLSS + temporal motion guides. "
-        "Legacy direct feature-18 path remains available only for diagnostics."
+        "DLSS 5 Neural Rendering with an in-process CUDA/D3D12 interop backend by default. "
+        "Carrier and legacy direct paths remain available as explicit fallbacks/diagnostics."
     )
 
     @staticmethod
@@ -654,6 +1162,9 @@ class AetherScaleNeuralRendering:
         carrier_warmup_frames=120,
         carrier_scene_cut_threshold=0.24,
         carrier_gpu="windows_high_performance",
+        native_chunk_frames=8,
+        native_scene_change_threshold=0.24,
+        native_fallback="carrier",
     ):
         if not isinstance(images, torch.Tensor) or images.ndim != 4:
             raise ValueError(f"Expected IMAGE [T,H,W,C], got {tuple(images.shape)}")
@@ -674,9 +1185,89 @@ class AetherScaleNeuralRendering:
 
         effective_min_free_mb = max(int(min_free_vram_mb), int(safety_margin_mb))
 
-        if backend == "carrier":
-            # Primary architecture: normal DLSS carrier + motion guides + RenoDX
-            # Neural Rendering injection. This avoids naked CreateFeature(18).
+        if backend == "native_interop":
+            try:
+                result, stats = process_native_interop(
+                    images,
+                    motion=motion,
+                    style=self._map_style(str(style)),
+                    preset=int(preset),
+                    intensity=float(strength),
+                    tone=float(local_tone),
+                    structure=float(local_structure),
+                    skin=float(skin_structure),
+                    auto_mask=bool(auto_mask),
+                    temporal_mode=temporal_mode,
+                    reset_on_scene_cut=bool(reset_on_scene_cut),
+                    scene_change_threshold=float(native_scene_change_threshold),
+                    gpu_index=int(cuda_device),
+                    safety_margin_mb=effective_min_free_mb,
+                    vram_guard=vram_guard,
+                    output_device=output_device,
+                    auto_bootstrap=bool(auto_bootstrap),
+                    runtime_path=runtime_path,
+                    output_precision=output_precision,
+                    output_storage=output_storage,
+                    clean_cache=bool(clean_cache),
+                    upscale_mode=upscale_mode,
+                    chunk_frames=int(native_chunk_frames),
+                    channel_order=channel_order,
+                )
+            except NativeNRInteropError as exc:
+                if native_fallback == "error":
+                    raise
+                print(
+                    f"[AetherScale] Native NR interop unavailable; explicit fallback "
+                    f"{native_fallback}: {exc}",
+                    flush=True,
+                )
+                if native_fallback == "carrier":
+                    result, stats = process_carrier(
+                        images,
+                        motion=motion,
+                        style=str(style),
+                        preset=int(preset),
+                        intensity=float(strength),
+                        tone=float(local_tone),
+                        structure=float(local_structure),
+                        skin=float(skin_structure),
+                        auto_mask=bool(auto_mask),
+                        upscale_mode=upscale_mode,
+                        warmup_frames=int(carrier_warmup_frames),
+                        scene_cut_threshold=float(carrier_scene_cut_threshold),
+                        motion_source=motion_source,
+                        auto_bootstrap=bool(auto_bootstrap),
+                        output_precision=output_precision,
+                        output_storage=output_storage,
+                        clean_cache=bool(clean_cache),
+                        carrier_gpu=carrier_gpu,
+                    )
+                else:
+                    result, stats = process_dlss5(
+                        images,
+                        style=self._map_style(str(style)),
+                        preset=int(preset),
+                        intensity=float(strength),
+                        tone=float(local_tone),
+                        structure=float(local_structure),
+                        skin=float(skin_structure),
+                        auto_mask=bool(auto_mask),
+                        temporal_mode=temporal_mode,
+                        channel_order=channel_order,
+                        gpu_index=int(cuda_device),
+                        vram_guard=vram_guard,
+                        min_free_vram_mb=effective_min_free_mb,
+                        output_device=output_device,
+                        auto_bootstrap=bool(auto_bootstrap),
+                        runtime_path=runtime_path,
+                        motion=motion,
+                        output_precision=output_precision,
+                        output_storage=output_storage,
+                        clean_cache=bool(clean_cache),
+                    )
+                stats["native_interop_fallback_reason"] = f"{type(exc).__name__}: {exc}"
+                stats["native_interop_fallback_backend"] = native_fallback
+        elif backend == "carrier":
             result, stats = process_carrier(
                 images,
                 motion=motion,
@@ -698,8 +1289,6 @@ class AetherScaleNeuralRendering:
                 carrier_gpu=carrier_gpu,
             )
         else:
-            # Legacy diagnostic backend only. Retained so existing experiments
-            # can still be reproduced, but it is no longer the default path.
             result, stats = process_dlss5(
                 images,
                 style=self._map_style(str(style)),
@@ -738,6 +1327,11 @@ class AetherScaleNeuralRendering:
             "memory_policy": memory_policy,
         }
         stats["effective_min_free_vram_mb"] = effective_min_free_mb
+        stats["native_settings"] = {
+            "chunk_frames": int(native_chunk_frames),
+            "scene_change_threshold": float(native_scene_change_threshold),
+            "fallback": str(native_fallback),
+        }
         return (result, json.dumps(stats, indent=2))
 
 
@@ -757,7 +1351,7 @@ class AetherScaleNeuralPlanner:
     CATEGORY = "AetherScale/Neural"
     def run(self, width, height, history_frames, safety_margin_mb, measured_context_mb):
         payload = neural_vram_plan(int(width),int(height),history_frames=int(history_frames),safety_margin_mb=int(safety_margin_mb),measured_context_mb=int(measured_context_mb))
-        payload["dlssnr"] = dlss5_runtime_info()
+        payload["dlssnr"] = {"native_interop": native_nr_runtime_info(), "legacy_direct": dlss5_runtime_info()}
         return (json.dumps(payload, indent=2),)
 
 
@@ -770,6 +1364,10 @@ NODE_CLASS_MAPPINGS = {
     "AetherScaleNeuralPlanner": AetherScaleNeuralPlanner,
     "AetherScaleRuntime": AetherScaleRuntime,
     "AetherScaleDiagnostics": AetherScaleDiagnostics,
+    "AetherScaleMFGLab": AetherScaleMFGLab,
+    "AetherScaleMFGVideo": AetherScaleMFGVideo,
+    "AetherScaleVideoLoader": AetherScaleVideoLoader,
+    "AetherScaleVideoCombine": AetherScaleVideoCombine,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AetherScaleSuperResolution": "AetherScale • Super Resolution",
@@ -780,4 +1378,19 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AetherScaleNeuralPlanner": "AetherScale • Neural VRAM Planner",
     "AetherScaleRuntime": "AetherScale • Runtime",
     "AetherScaleDiagnostics": "AetherScale • Diagnostics",
+    "AetherScaleMFGLab": "AetherScale • MFG",
+    "AetherScaleMFGVideo": "AetherScale • MFG Video",
+    "AetherScaleVideoLoader": "AetherScale • Video Loader",
+    "AetherScaleVideoCombine": "AetherScale • Video Combine",
 }
+
+
+# Every AetherScale node reports start/finish/error timing in the console.
+# Long frame-processing backends additionally emit detailed progress bars with
+# frame/pair throughput and ETA through backend.progress.ConsoleProgress.
+for _node_id, _node_cls in NODE_CLASS_MAPPINGS.items():
+    _display = NODE_DISPLAY_NAME_MAPPINGS.get(_node_id, _node_id)
+    _fn_name = getattr(_node_cls, "FUNCTION", "run")
+    _fn = getattr(_node_cls, _fn_name, None)
+    if callable(_fn) and not getattr(_fn, "_aetherscale_console_wrapped", False):
+        setattr(_node_cls, _fn_name, console_node(_display)(_fn))

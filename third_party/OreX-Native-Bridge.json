@@ -1,0 +1,21 @@
+{
+  "project": "orex2121/ComfyUI-DLSS5-orex",
+  "license": "MIT",
+  "pinned_commit": "739208e7ae5f576355fc5c30ffb77c4de2e61984",
+  "files": {
+    "bridge/bin/dlss5nr_bridge.dll": {
+      "size": 238592,
+      "git_blob_sha1": "ffd67747b1272607753743907369e4fb570b0efe"
+    },
+    "runtime/caller/nvngx.dll_comfy.dll": {
+      "size": 103424,
+      "git_blob_sha1": "c69856b68a67a795de27c307919adf2ec7dd0ac2"
+    }
+  },
+  "verified_runtime": {
+    "asset": "nvngx-v1/nvngx_dlssnr.dll",
+    "size": 165830144,
+    "sha256": "6eb209e764f39872625debd6abaf45e2bb6322f6f270f781f70c059ae30b3927"
+  },
+  "integration_note": "AetherScale uses these as declared third-party binary dependencies. AetherScale's Python adapter, GPU matching, chunking, storage, progress/interrupt and fallback logic are independent project code."
+}

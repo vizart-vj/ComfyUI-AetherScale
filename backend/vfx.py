@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import gc
 import inspect
+import queue
 import threading
 import time
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -11,7 +12,8 @@ import torch
 import torch.nn.functional as F
 
 from .runtime import RuntimeManager
-from .storage import allocate_cpu_tensor, resolve_dtype
+from .progress import ConsoleProgress, throw_if_interrupted
+from .storage import allocate_cpu_tensor, resolve_dtype, sync_file_backed_tensor
 
 
 QUALITY_MAP: Dict[Tuple[str, str], str] = {
@@ -337,6 +339,15 @@ def _stream_video_super_res(
     output_storage: str = "auto",
     clean_cache: bool = True,
 ) -> tuple[torch.Tensor, dict]:
+    """Stream NVIDIA VSR with GPU/CPU write overlap.
+
+    The v0.8.7 path serialized GPU VSR -> D2H -> mmap write -> FlushViewOfFile
+    for every frame. On large disk-spill outputs that made the RTX wait on the
+    SATA SSD and looked like CPU-only processing. This path keeps only two
+    pinned output frames and lets a writer thread persist frame N while NVIDIA
+    VFX computes frame N+1. The full output is still bounded by the storage
+    layer and never materialized as an extra RAM copy.
+    """
     src_device = images_bhwc.device
     cuda_device = torch.device(f"cuda:{config.device}")
     batch = int(images_bhwc.shape[0])
@@ -354,59 +365,258 @@ def _stream_video_super_res(
         prefix="vsr",
         clean_cache=bool(clean_cache),
     )
+    label = "Super Resolution" if config.mode in {"high_bitrate", "compressed", "bicubic"} else f"Restoration / {config.mode}"
+    console_progress = ConsoleProgress(label, batch, unit="frame")
+    pipeline_mode = "cpu_bicubic"
+    staging_pinned = False
 
-    if config.mode == "bicubic":
-        for i in range(batch):
-            frame = images_bhwc[i, ..., :3].to(dtype=torch.float32)
-            bchw = frame.permute(2,0,1).unsqueeze(0).contiguous()
-            resized = F.interpolate(
-                bchw,size=(config.out_height,config.out_width),
-                mode="bicubic",align_corners=False,antialias=True
-            )[0].permute(1,2,0).contiguous().clamp_(0,1)
-            out_cpu[i,...,:3].copy_(resized.to("cpu",dtype=out_dtype))
-            del frame,bchw,resized
-    else:
-        if cache_policy=="single": _CACHE.evict_except(config)
-        elif cache_policy=="none": _CACHE.clear()
-        effect=_CACHE.get(config)
-        with torch.cuda.device(cuda_device):
-            stream = torch.cuda.Stream(device=cuda_device) if cuda_stream_mode=="dedicated" else torch.cuda.current_stream(device=cuda_device)
+    try:
+        if config.mode == "bicubic":
             for i in range(batch):
-                frame=(images_bhwc[i,...,:3].to(cuda_device,dtype=torch.float32,non_blocking=False)
-                       .clamp_(0,1).permute(2,0,1).contiguous())
-                result=effect.run(frame,non_blocking=False,stream_ptr=int(stream.cuda_stream))
-                view=torch.from_dlpack(result.image).permute(1,2,0)
-                out_cpu[i,...,:3].copy_(view.to(device="cpu",dtype=out_dtype),non_blocking=False)
-                del view,result,frame
-                if memory_policy=="aggressive": torch.cuda.empty_cache()
+                throw_if_interrupted()
+                frame = images_bhwc[i, ..., :3].to(dtype=torch.float32)
+                bchw = frame.permute(2, 0, 1).unsqueeze(0).contiguous()
+                resized = F.interpolate(
+                    bchw,
+                    size=(config.out_height, config.out_width),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )[0].permute(1, 2, 0).contiguous().clamp_(0, 1)
+                out_cpu[i, ..., :3].copy_(resized.to("cpu", dtype=out_dtype))
+                del frame, bchw, resized
+                sync_file_backed_tensor(
+                    out_cpu,
+                    bytes_written=out_cpu[i, ..., :3].numel() * out_cpu.element_size(),
+                )
+                console_progress.update(1)
+        else:
+            pipeline_mode = "nvidia_vfx_gpu_overlapped_writer"
+            if cache_policy == "single":
+                _CACHE.evict_except(config)
+            elif cache_policy == "none":
+                _CACHE.clear()
+            effect = _CACHE.get(config)
 
-    # Alpha is streamed frame-by-frame; never materialize BxHxW alpha temp.
-    if channels==4:
-        for i in range(batch):
-            a=images_bhwc[i:i+1,...,3:4].to(device="cpu",dtype=torch.float32)
-            a=F.interpolate(
-                a.permute(0,3,1,2),
-                size=(config.out_height,config.out_width),
-                mode="bilinear",align_corners=False
-            ).permute(0,2,3,1)[0]
-            out_cpu[i,...,3:4].copy_(a.to(dtype=out_dtype))
-            del a
+            # Two frame-sized staging buffers are enough to overlap GPU compute
+            # with disk/RAM persistence while keeping pinned memory bounded.
+            staging: list[torch.Tensor] = []
+            try:
+                staging = [
+                    torch.empty(
+                        (config.out_height, config.out_width, 3),
+                        dtype=out_dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    for _ in range(2)
+                ]
+                staging_pinned = True
+            except Exception:
+                staging = [
+                    torch.empty(
+                        (config.out_height, config.out_width, 3),
+                        dtype=out_dtype,
+                        device="cpu",
+                    )
+                    for _ in range(2)
+                ]
+                staging_pinned = False
 
-    if cache_policy=="none": _CACHE.clear()
+            free_slots: "queue.Queue[int]" = queue.Queue(maxsize=2)
+            for slot_index in range(2):
+                free_slots.put(slot_index)
+            write_q: "queue.Queue[object]" = queue.Queue(maxsize=2)
+            sentinel = object()
+            stop = threading.Event()
+            writer_errors: list[BaseException] = []
 
-    if output_device=="same_as_input" and src_device.type!="cpu":
+            def _get_free_slot() -> int:
+                while True:
+                    throw_if_interrupted()
+                    if writer_errors:
+                        raise writer_errors[0]
+                    try:
+                        return free_slots.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+
+            def _writer() -> None:
+                try:
+                    while not stop.is_set():
+                        try:
+                            item = write_q.get(timeout=0.05)
+                        except queue.Empty:
+                            continue
+                        if item is sentinel:
+                            return
+                        slot_index, frame_index, ready_event, keepalive = item  # type: ignore[misc]
+                        ready_event.synchronize()
+                        if stop.is_set():
+                            return
+                        out_cpu[frame_index, ..., :3].copy_(staging[slot_index], non_blocking=False)
+                        sync_file_backed_tensor(
+                            out_cpu,
+                            bytes_written=out_cpu[frame_index, ..., :3].numel() * out_cpu.element_size(),
+                        )
+                        # `keepalive` owns the DLPack view/result until D2H has
+                        # completed. Releasing it before event synchronization can
+                        # invalidate runtime-owned output storage.
+                        del keepalive
+                        free_slots.put(slot_index)
+                except BaseException as exc:
+                    writer_errors.append(exc)
+                    stop.set()
+                    # Wake the producer if it is waiting for a staging slot.
+                    try:
+                        free_slots.put_nowait(0)
+                    except queue.Full:
+                        pass
+
+            writer_thread = threading.Thread(
+                target=_writer,
+                name="AetherScaleVSRWriter",
+                daemon=True,
+            )
+            writer_thread.start()
+
+            try:
+                with torch.cuda.device(cuda_device):
+                    stream = (
+                        torch.cuda.Stream(device=cuda_device)
+                        if cuda_stream_mode == "dedicated"
+                        else torch.cuda.current_stream(device=cuda_device)
+                    )
+                    for i in range(batch):
+                        throw_if_interrupted()
+                        slot_index = _get_free_slot()
+                        if writer_errors:
+                            raise writer_errors[0]
+
+                        frame = (
+                            images_bhwc[i, ..., :3]
+                            .to(cuda_device, dtype=torch.float32, non_blocking=False)
+                            .clamp_(0, 1)
+                            .permute(2, 0, 1)
+                            .contiguous()
+                        )
+                        result = effect.run(
+                            frame,
+                            non_blocking=False,
+                            stream_ptr=int(stream.cuda_stream),
+                        )
+                        view = torch.from_dlpack(result.image).permute(1, 2, 0)
+                        with torch.cuda.stream(stream):
+                            staging[slot_index].copy_(
+                                view,
+                                non_blocking=bool(staging_pinned),
+                            )
+                            ready_event = torch.cuda.Event(blocking=False)
+                            ready_event.record(stream)
+
+                        # Backpressure is bounded to two staged frames. Disk I/O
+                        # can run concurrently with the next effect invocation.
+                        while True:
+                            throw_if_interrupted()
+                            if writer_errors:
+                                raise writer_errors[0]
+                            try:
+                                write_q.put(
+                                    (slot_index, i, ready_event, (view, result)),
+                                    timeout=0.05,
+                                )
+                                break
+                            except queue.Full:
+                                continue
+                        del frame
+                        if memory_policy == "aggressive" and (i + 1) % 32 == 0:
+                            # Emptying CUDA cache every frame globally synchronizes
+                            # the allocator and destroys overlap. 32-frame cadence
+                            # retains the low-VRAM intent without serializing VSR.
+                            torch.cuda.empty_cache()
+                        console_progress.update(1)
+
+                # Wait interruptibly for the CPU writer to persist its final jobs.
+                while not write_q.empty() or free_slots.qsize() < 2:
+                    throw_if_interrupted()
+                    if writer_errors:
+                        raise writer_errors[0]
+                    time.sleep(0.02)
+                while True:
+                    try:
+                        write_q.put(sentinel, timeout=0.05)
+                        break
+                    except queue.Full:
+                        throw_if_interrupted()
+                while writer_thread.is_alive():
+                    throw_if_interrupted()
+                    writer_thread.join(timeout=0.05)
+                if writer_errors:
+                    raise writer_errors[0]
+            except BaseException:
+                stop.set()
+                try:
+                    write_q.put_nowait(sentinel)
+                except queue.Full:
+                    pass
+                writer_thread.join(timeout=1.0)
+                raise
+            finally:
+                stop.set()
+
+        # Alpha is streamed frame-by-frame; never materialize BxHxW alpha temp.
+        if channels == 4:
+            for i in range(batch):
+                throw_if_interrupted()
+                a = images_bhwc[i:i + 1, ..., 3:4].to(device="cpu", dtype=torch.float32)
+                a = F.interpolate(
+                    a.permute(0, 3, 1, 2),
+                    size=(config.out_height, config.out_width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).permute(0, 2, 3, 1)[0]
+                out_cpu[i, ..., 3:4].copy_(a.to(dtype=out_dtype))
+                sync_file_backed_tensor(
+                    out_cpu,
+                    bytes_written=out_cpu[i, ..., 3:4].numel() * out_cpu.element_size(),
+                )
+                del a
+
+        sync_file_backed_tensor(out_cpu, force=True)
+        console_progress.close(status="done")
+    except BaseException:
+        console_progress.close(status="failed")
+        raise
+    finally:
+        if cache_policy == "none":
+            _CACHE.clear()
+
+    throw_if_interrupted()
+    if output_device == "same_as_input" and src_device.type != "cpu":
         # Explicitly requested: may be huge and can OOM.
-        out=out_cpu.to(src_device,non_blocking=False)
+        out = out_cpu.to(src_device, non_blocking=False)
     else:
-        out=out_cpu
+        out = out_cpu
     return out, {
-        "output_storage_backend":storage.backend,
-        "output_storage_path":storage.path,
-        "output_precision":storage.dtype,
-        "output_bytes":storage.bytes,
-        "output_gib":round(storage.bytes/1024**3,3),
+        "output_storage_backend": storage.backend,
+        "output_storage_path": storage.path,
+        "output_precision": storage.dtype,
+        "output_bytes": storage.bytes,
+        "output_gib": round(storage.bytes / 1024 ** 3, 3),
+        "output_storage_fallback_reason": storage.fallback_reason,
+        "system_commit_available_gib_at_allocation": (
+            round(storage.commit_available_bytes / 1024 ** 3, 3)
+            if storage.commit_available_bytes is not None else None
+        ),
+        "spill_disk_free_gib_at_allocation": (
+            round(storage.disk_free_bytes / 1024 ** 3, 3)
+            if storage.disk_free_bytes is not None else None
+        ),
+        "pipeline_mode": pipeline_mode,
+        "gpu_cpu_overlap": bool(config.mode != "bicubic"),
+        "pinned_staging": bool(staging_pinned),
+        "staging_frames": 2 if config.mode != "bicubic" else 0,
     }
-
 
 
 def _hdr_profile_params(profile: str) -> tuple[float, float, float, float]:
@@ -493,10 +703,15 @@ def _stream_cuda_hdr(
     config: VFXConfig,
     memory_policy: str,
     output_device: str,
-) -> torch.Tensor:
+    output_precision: str = "auto",
+    output_storage: str = "auto",
+    clean_cache: bool = True,
+) -> tuple[torch.Tensor, dict]:
     src_device = images_bhwc.device
     cuda_device = torch.device(f"cuda:{config.device}")
     batch = int(images_bhwc.shape[0])
+    in_channels = int(images_bhwc.shape[-1])
+    out_channels = 4 if in_channels > 3 else 3
     extras = dict(config.extras)
     profile = extras.get("mode_profile", "balanced")
     strength = float(extras.get("strength", 0.75))
@@ -504,12 +719,22 @@ def _stream_cuda_hdr(
     contrast = float(extras.get("contrast", 1.0))
     highlight_preservation = float(extras.get("highlight_preservation", 0.75))
 
-    out_cpu = torch.empty(
-        (batch, config.out_height, config.out_width, 3),
-        dtype=torch.float32,
-        device="cpu",
-        pin_memory=torch.cuda.is_available(),
+    out_shape = (batch, config.out_height, config.out_width, out_channels)
+    out_dtype = resolve_dtype(
+        requested=str(output_precision),
+        shape=out_shape,
+        input_dtype=images_bhwc.dtype,
+        auto_fp16_threshold_mb=512,
     )
+    out_cpu, storage = allocate_cpu_tensor(
+        out_shape,
+        dtype=out_dtype,
+        storage_mode=str(output_storage),
+        prefix="hdr",
+        mmap_threshold_mb=512,
+        clean_cache=bool(clean_cache),
+    )
+    console_progress = ConsoleProgress("HDR", batch, unit="frame")
 
     with torch.cuda.device(cuda_device):
         for i in range(batch):
@@ -524,13 +749,34 @@ def _stream_cuda_hdr(
                 contrast=contrast,
                 highlight_preservation=highlight_preservation,
             )
-            out_cpu[i].copy_(enhanced.permute(1, 2, 0), non_blocking=False)
-            del enhanced, frame
+            rgb = enhanced.permute(1, 2, 0).to(dtype=out_dtype)
+            out_cpu[i, ..., :3].copy_(rgb.to("cpu", non_blocking=False), non_blocking=False)
+            if out_channels == 4:
+                alpha = images_bhwc[i, ..., 3:4].detach()
+                if alpha.device.type != "cpu":
+                    alpha = alpha.to("cpu", non_blocking=False)
+                out_cpu[i, ..., 3:4].copy_(alpha.to(dtype=out_dtype), non_blocking=False)
+            del rgb, enhanced, frame
             if memory_policy == "aggressive":
                 torch.cuda.empty_cache()
+            sync_file_backed_tensor(
+                out_cpu,
+                bytes_written=out_cpu[i].numel() * out_cpu.element_size(),
+            )
+            console_progress.update(1)
 
-    out_cpu = _append_alpha_if_needed(images_bhwc, out_cpu, config.out_height, config.out_width)
-    return _finalize_output_device(out_cpu, src_device, output_device)
+    sync_file_backed_tensor(out_cpu, force=True)
+    console_progress.close(status="done")
+    storage_stats = {
+        "output_dtype": str(out_dtype).replace("torch.", ""),
+        "output_storage_backend": storage.backend,
+        "output_storage_bytes": int(storage.bytes),
+        "output_storage_gib": round(storage.bytes / (1024 ** 3), 3),
+        "output_storage_path": storage.path,
+        "output_storage_fallback_reason": storage.fallback_reason,
+        "clean_cache": bool(clean_cache),
+    }
+    return _finalize_output_device(out_cpu, src_device, output_device), storage_stats
 
 def _stream_video_hdr(
     images_bhwc: torch.Tensor,
@@ -540,10 +786,15 @@ def _stream_video_hdr(
     cuda_stream_mode: str,
     memory_policy: str,
     output_device: str,
-) -> torch.Tensor:
+    output_precision: str = "auto",
+    output_storage: str = "auto",
+    clean_cache: bool = True,
+) -> tuple[torch.Tensor, dict]:
     src_device = images_bhwc.device
     cuda_device = torch.device(f"cuda:{config.device}")
     batch = int(images_bhwc.shape[0])
+    in_channels = int(images_bhwc.shape[-1])
+    out_channels = 4 if in_channels > 3 else 3
 
     if cache_policy == "single":
         _CACHE.evict_except(config)
@@ -551,11 +802,22 @@ def _stream_video_hdr(
         _CACHE.clear()
 
     effect = _CACHE.get(config)
-    out_cpu = torch.empty(
-        (batch, config.out_height, config.out_width, 3),
-        dtype=torch.float32,
-        device="cpu",
+    out_shape = (batch, config.out_height, config.out_width, out_channels)
+    out_dtype = resolve_dtype(
+        requested=str(output_precision),
+        shape=out_shape,
+        input_dtype=images_bhwc.dtype,
+        auto_fp16_threshold_mb=512,
     )
+    out_cpu, storage = allocate_cpu_tensor(
+        out_shape,
+        dtype=out_dtype,
+        storage_mode=str(output_storage),
+        prefix="hdr_vfx",
+        mmap_threshold_mb=512,
+        clean_cache=bool(clean_cache),
+    )
+    console_progress = ConsoleProgress("HDR / NVIDIA VFX", batch, unit="frame")
 
     with torch.cuda.device(cuda_device):
         if cuda_stream_mode == "dedicated":
@@ -566,34 +828,42 @@ def _stream_video_hdr(
         for i in range(batch):
             frame_hwc = images_bhwc[i, ..., :3]
             frame = (
-                frame_hwc.to(
-                    device=cuda_device,
-                    dtype=torch.float32,
-                    non_blocking=False,
-                )
-                .clamp_(0.0, 1.0)
-                .permute(2, 0, 1)
-                .contiguous()
+                frame_hwc.to(device=cuda_device, dtype=torch.float32, non_blocking=False)
+                .clamp_(0.0, 1.0).permute(2, 0, 1).contiguous()
             )
-            result = effect.run(
-                frame,
-                non_blocking=False,
-                stream_ptr=int(stream.cuda_stream),
-            )
+            result = effect.run(frame, non_blocking=False, stream_ptr=int(stream.cuda_stream))
             out_view_chw = torch.from_dlpack(result.image)
-            out_view_hwc = out_view_chw.permute(1, 2, 0)
-            out_cpu[i].copy_(out_view_hwc, non_blocking=False)
-
+            out_view_hwc = out_view_chw.permute(1, 2, 0).to(dtype=out_dtype)
+            out_cpu[i, ..., :3].copy_(out_view_hwc.to("cpu", non_blocking=False), non_blocking=False)
+            if out_channels == 4:
+                alpha = images_bhwc[i, ..., 3:4].detach()
+                if alpha.device.type != "cpu":
+                    alpha = alpha.to("cpu", non_blocking=False)
+                out_cpu[i, ..., 3:4].copy_(alpha.to(dtype=out_dtype), non_blocking=False)
             del out_view_hwc, out_view_chw, result, frame, frame_hwc
             if memory_policy == "aggressive":
                 torch.cuda.empty_cache()
+            sync_file_backed_tensor(
+                out_cpu,
+                bytes_written=out_cpu[i].numel() * out_cpu.element_size(),
+            )
+            console_progress.update(1)
 
+    sync_file_backed_tensor(out_cpu, force=True)
+    console_progress.close(status="done")
     if cache_policy == "none":
         _CACHE.clear()
 
-    out_cpu = _append_alpha_if_needed(images_bhwc, out_cpu, config.out_height, config.out_width)
-    return _finalize_output_device(out_cpu, src_device, output_device)
-
+    storage_stats = {
+        "output_dtype": str(out_dtype).replace("torch.", ""),
+        "output_storage_backend": storage.backend,
+        "output_storage_bytes": int(storage.bytes),
+        "output_storage_gib": round(storage.bytes / (1024 ** 3), 3),
+        "output_storage_path": storage.path,
+        "output_storage_fallback_reason": storage.fallback_reason,
+        "clean_cache": bool(clean_cache),
+    }
+    return _finalize_output_device(out_cpu, src_device, output_device), storage_stats
 
 def available_capabilities() -> Dict[str, Any]:
     state = RuntimeManager.probe()
@@ -746,6 +1016,9 @@ class VFXBackend:
         vram_guard: str,
         min_free_vram_mb: int,
         output_device: str,
+        output_precision: str = "auto",
+        output_storage: str = "auto",
+        clean_cache: bool = True,
     ) -> Tuple[torch.Tensor, dict]:
         if images_bhwc.ndim != 4:
             raise ValueError(
@@ -773,24 +1046,30 @@ class VFXBackend:
         nvvfx = _ensure_runtime_module()
         native_hdr = _find_first_attr(nvvfx, HDR_CLASS_CANDIDATES) is not None
         if native_hdr:
-            out = _stream_video_hdr(
+            out, storage_stats = _stream_video_hdr(
                 images_bhwc,
                 config=config,
                 cache_policy=cache_policy,
                 cuda_stream_mode=cuda_stream_mode,
                 memory_policy=memory_policy,
                 output_device=output_device,
+                output_precision=output_precision,
+                output_storage=output_storage,
+                clean_cache=clean_cache,
             )
             hdr_engine = "NVIDIA VFX HDR"
         else:
             # Current NVIDIA VFX SDK releases do not expose an HDR effect.
             # Use AetherScale's CUDA-native HDR-style enhancer instead of
             # failing symbol discovery.
-            out = _stream_cuda_hdr(
+            out, storage_stats = _stream_cuda_hdr(
                 images_bhwc,
                 config=config,
                 memory_policy=memory_policy,
                 output_device=output_device,
+                output_precision=output_precision,
+                output_storage=output_storage,
+                clean_cache=clean_cache,
             )
             hdr_engine = "AetherScale CUDA HDR"
 
@@ -826,5 +1105,6 @@ class VFXBackend:
             "vram_free_after_release_mb": round(after_release_free / (1024 * 1024), 1),
             "vram_free_final_mb": round(final_free / (1024 * 1024), 1),
             "vram_total_mb": round(total_vram / (1024 * 1024), 1),
+            **storage_stats,
         }
         return out, stats

@@ -11,7 +11,6 @@ import struct
 import subprocess
 import threading
 import time
-import urllib.request
 import zipfile
 
 try:
@@ -23,7 +22,9 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from .storage import allocate_cpu_tensor, resolve_dtype
+from .storage import allocate_cpu_tensor, resolve_dtype, sync_file_backed_tensor
+from .download import DownloadFailure, download_file
+from .progress import ConsoleProgress
 
 ROOT = Path(__file__).resolve().parents[1]
 CARRIER_ROOT = ROOT / "runtime" / "carrier"
@@ -38,6 +39,10 @@ UPSTREAM_URL = (
     "v1.0/DLSS.5.Visual.Enhancer.v1.0.zip"
 )
 UPSTREAM_SHA256 = "5d57c2f2d2a1c247c0249e7a1024eabb5384ee9111820a4a478be6ce893b767d"
+UPSTREAM_API_ASSET_URL = (
+    "https://api.github.com/repos/Merserk/dlss5-visual-enhancer/"
+    "releases/assets/538645660"
+)
 
 REQUIRED_RUNTIME = (
     "nvngx.dll",
@@ -85,17 +90,134 @@ def _sha256_file(path: Path) -> str:
 
 def _download(url: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-AetherScale/0.5.5"})
-    with urllib.request.urlopen(req, timeout=240) as resp, path.open("wb") as out:
-        while True:
-            chunk = resp.read(8 * 1024 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
+    download_file(
+        url,
+        path,
+        user_agent="ComfyUI-AetherScale/0.9.2",
+        timeout=240,
+    )
 
 
 def _runtime_ready() -> bool:
     return all((CARRIER_RUNTIME / name).is_file() for name in REQUIRED_RUNTIME)
+
+
+def _carrier_archive_candidates() -> list[Path]:
+    """Return trusted local locations for an already-downloaded upstream archive."""
+    candidates: list[Path] = []
+    env_path = os.environ.get("AETHERSCALE_CARRIER_ARCHIVE", "").strip()
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+
+    filename = "DLSS.5.Visual.Enhancer.v1.0.zip"
+    candidates.append(CARRIER_ROOT / filename)
+    userprofile = os.environ.get("USERPROFILE", "").strip()
+    if userprofile:
+        candidates.append(Path(userprofile) / "Downloads" / filename)
+    try:
+        candidates.append(Path.home() / "Downloads" / filename)
+    except Exception:
+        pass
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key not in seen:
+            unique.append(candidate)
+            seen.add(key)
+    return unique
+
+
+def _obtain_carrier_archive(archive: Path) -> tuple[str, str]:
+    """Resolve the pinned archive locally first, then use resilient network transports."""
+    explicit = os.environ.get("AETHERSCALE_CARRIER_ARCHIVE", "").strip()
+    for candidate in _carrier_archive_candidates():
+        if not candidate.is_file():
+            continue
+        digest = _sha256_file(candidate)
+        if digest.lower() != UPSTREAM_SHA256.lower():
+            if explicit and str(candidate).lower() == str(Path(explicit).expanduser()).lower():
+                raise CarrierError(
+                    "AETHERSCALE_CARRIER_ARCHIVE points to a file with the wrong SHA-256: "
+                    f"expected {UPSTREAM_SHA256}, got {digest}."
+                )
+            continue
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(candidate, archive)
+        print(f"[AetherScale] Using local Visual Enhancer archive: {candidate}")
+        return digest, f"local:{candidate}"
+
+    mirror = os.environ.get("AETHERSCALE_CARRIER_URL", "").strip()
+    errors: list[str] = []
+
+    # A user-selected mirror is allowed, but it must match the exact pinned hash.
+    if mirror:
+        try:
+            meta = download_file(
+                mirror,
+                archive,
+                user_agent="ComfyUI-AetherScale/0.9.2",
+                timeout=240,
+            )
+            digest = _sha256_file(archive)
+            if digest.lower() == UPSTREAM_SHA256.lower():
+                print(
+                    "[AetherScale] Carrier archive downloaded via "
+                    f"{meta.get('transport', 'unknown')} from configured mirror."
+                )
+                return digest, f"download:{meta.get('url', mirror)}"
+            errors.append(
+                f"{mirror}: checksum mismatch (expected {UPSTREAM_SHA256}, got {digest})"
+            )
+            archive.unlink(missing_ok=True)
+        except (DownloadFailure, OSError, RuntimeError) as exc:
+            errors.append(f"{mirror}: {exc}")
+            try:
+                archive.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # Official browser-download URL plus the same public release asset through
+    # api.github.com. Both are upstream GitHub endpoints for the identical asset.
+    try:
+        meta = download_file(
+            UPSTREAM_URL,
+            archive,
+            user_agent="ComfyUI-AetherScale/0.9.2",
+            timeout=240,
+            extra_urls=(UPSTREAM_API_ASSET_URL,),
+            headers={"Accept": "application/octet-stream"},
+        )
+        digest = _sha256_file(archive)
+        if digest.lower() != UPSTREAM_SHA256.lower():
+            archive.unlink(missing_ok=True)
+            raise CarrierError(
+                "Visual Enhancer release checksum mismatch: "
+                f"expected {UPSTREAM_SHA256}, got {digest}."
+            )
+        print(
+            "[AetherScale] Carrier archive downloaded via "
+            f"{meta.get('transport', 'unknown')} from {meta.get('url', UPSTREAM_URL)} "
+            f"(proxy={meta.get('proxy_state', 'unknown')})."
+        )
+        return digest, f"download:{meta.get('url', UPSTREAM_URL)}"
+    except (DownloadFailure, OSError, RuntimeError) as exc:
+        errors.append(f"official GitHub release: {exc}")
+        try:
+            archive.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    detail = " | ".join(errors)
+    raise CarrierError(
+        "Unable to install the DLSS5 carrier runtime. AetherScale tried a direct "
+        "proxy-bypass connection, the configured system proxy, curl, and PowerShell, "
+        "but every transport failed. If GitHub is blocked on this machine, place the "
+        "official DLSS.5.Visual.Enhancer.v1.0.zip in your Windows Downloads folder or "
+        "set AETHERSCALE_CARRIER_ARCHIVE to that file. The pinned SHA-256 is still "
+        f"verified before extraction. Details: {detail}"
+    )
 
 
 def ensure_carrier(auto_bootstrap: bool = True, force: bool = False) -> dict[str, Any]:
@@ -120,13 +242,7 @@ def ensure_carrier(auto_bootstrap: bool = True, force: bool = False) -> dict[str
         archive = CARRIER_ROOT / ".visual-enhancer-v1.0.zip"
         print("[AetherScale] Installing DLSS5 carrier backend from Visual Enhancer v1.0...")
         try:
-            _download(UPSTREAM_URL, archive)
-            digest = _sha256_file(archive)
-            if digest.lower() != UPSTREAM_SHA256.lower():
-                raise CarrierError(
-                    "Visual Enhancer release checksum mismatch: "
-                    f"expected {UPSTREAM_SHA256}, got {digest}."
-                )
+            digest, archive_source = _obtain_carrier_archive(archive)
 
             found: dict[str, str] = {}
             with zipfile.ZipFile(archive, "r") as zf:
@@ -162,6 +278,7 @@ def ensure_carrier(auto_bootstrap: bool = True, force: bool = False) -> dict[str
                 "source": "Merserk/dlss5-visual-enhancer",
                 "release": UPSTREAM_RELEASE,
                 "archive_url": UPSTREAM_URL,
+                "archive_source": archive_source,
                 "archive_sha256": digest,
                 "files": {
                     name: {
@@ -180,6 +297,7 @@ def ensure_carrier(auto_bootstrap: bool = True, force: bool = False) -> dict[str
                 "release": UPSTREAM_RELEASE,
                 "runtime": str(CARRIER_RUNTIME),
                 "worker": str(WORKER),
+                "archive_source": archive_source,
                 "archive_sha256": digest,
             }
         finally:
@@ -566,6 +684,7 @@ def process_carrier(
                 f"Carrier negotiated {nego_ow}x{nego_oh}, expected {ow}x{oh}."
             )
 
+        console_progress = ConsoleProgress("Neural Rendering / carrier", batch, unit="frame")
         for i in range(batch):
             rgb = images[i, ..., :3].detach().to("cpu", dtype=torch.float32)
             rgb8 = (rgb.clamp(0, 1).numpy() * 255.0 + 0.5).astype(np.uint8)
@@ -637,7 +756,14 @@ def process_carrier(
                     out_cpu[i, ..., 3:4].copy_(alpha.to(dtype=out_dtype))
                 except Exception:
                     out_cpu[i, ..., 3].fill_(1)
+            sync_file_backed_tensor(
+                out_cpu,
+                bytes_written=out_cpu[i].numel() * out_cpu.element_size(),
+            )
+            console_progress.update(1)
 
+        sync_file_backed_tensor(out_cpu, force=True)
+        console_progress.close(status="done")
         proc.stdin.close()
         code = proc.wait(timeout=60)
         t.join(timeout=2)
@@ -674,6 +800,15 @@ def process_carrier(
         "output_precision": storage.dtype,
         "output_storage_backend": storage.backend,
         "output_storage_path": storage.path,
+        "output_storage_fallback_reason": storage.fallback_reason,
+        "system_commit_available_gib_at_allocation": (
+            round(storage.commit_available_bytes / 1024**3, 3)
+            if storage.commit_available_bytes is not None else None
+        ),
+        "spill_disk_free_gib_at_allocation": (
+            round(storage.disk_free_bytes / 1024**3, 3)
+            if storage.disk_free_bytes is not None else None
+        ),
         "clean_cache": bool(clean_cache),
         "output_gib": round(storage.bytes / 1024**3, 3),
         "worker_log_tail": stderr_lines[-20:],

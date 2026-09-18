@@ -34,9 +34,9 @@ The Comfy Registry publisher ID is globally unique and immutable. Before the fir
 
 The package is prepared for:
 
-`https://github.com/noise/ComfyUI-AetherScale`
+`https://github.com/vizart-vj/ComfyUI-AetherScale`
 
-If the actual GitHub repository lives under a different account/organization, update only the URLs under `[project.urls]` before the first Registry publish. Keep `PublisherId = "noise"` if `noise` is the Registry publisher you created.
+GitHub repository owner and Comfy Registry publisher are intentionally different: GitHub lives under `vizart-vj`, while `PublisherId = "noise"` is used for the Comfy Registry. Keep the project author as `noise`.
 
 ## Registry secret
 
@@ -57,9 +57,14 @@ The included `.github/workflows/publish-comfy-registry.yml` supports manual publ
 For every release:
 
 1. update `version` in `pyproject.toml`;
-2. update `CHANGELOG.md`;
-3. commit and push to `main`;
-4. verify the `Publish to Comfy Registry` GitHub Action;
-5. create the matching GitHub Release/tag.
+2. update the version reported by the nodes/runtime User-Agent;
+3. update `README.md` (current version, controls, backend behavior, and release notes);
+4. update `CHANGELOG.md` and `THIRD_PARTY_NOTICES.md` when runtime sources/hashes or wording change;
+5. verify public author/publisher metadata remains `noise`;
+6. commit and push to `main`;
+7. verify the `Publish to Comfy Registry` GitHub Action;
+8. create the matching GitHub Release/tag.
+
+`ex.png` is intentionally referenced by `README.md` but excluded from the packaged Registry/archive payload. Keep the screenshot in the GitHub repository itself when desired.
 
 The Registry node ID is `aetherscale` and should not be changed after the first successful publication.

@@ -1,7 +1,7 @@
 [project]
 name = "aetherscale"
-version = "0.5.5"
-description = "GPU-native NVIDIA video enhancement, restoration, temporal analysis, and experimental DLSS 5 Neural Rendering nodes for ComfyUI."
+version = "0.9.2"
+description = "GPU-native NVIDIA enhancement with in-process DLSS Neural Rendering, native DLSS Frame Generation, and high-throughput NVENC/ProRes video output nodes for ComfyUI."
 authors = [{ name = "noise" }]
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

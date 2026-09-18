@@ -7,8 +7,10 @@ from typing import Any, Dict, Tuple
 import torch
 import torch.nn.functional as F
 
+from .progress import ConsoleProgress
+
 PROJECT_ID = "0f5a1142-14ad-4f90-a7a2-e2812fb91c4a"
-ENGINE_VERSION = "AetherScale-0.4.2"
+ENGINE_VERSION = "AetherScale-0.9.2"
 
 
 @dataclass(slots=True)
@@ -121,6 +123,75 @@ def dense_lk_flow(a, b, levels: int, iterations: int, window: int):
         flow,conf=_lk_level(aa,bb,flow,iterations,window)
     return flow,conf
 
+def _flow_photo_error(target: torch.Tensor, source: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    """Per-pixel photometric residual for flow mapping target -> source."""
+    warped = _warp(source, flow)
+    return (warped - target).abs().mean(dim=1, keepdim=True)
+
+
+def _robust_refine_flow(
+    target: torch.Tensor,
+    source: torch.Tensor,
+    base_flow: torch.Tensor,
+    base_conf: torch.Tensor,
+    refined_flow: torch.Tensor,
+    refined_conf: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Anchor expensive LK refinement to the stable fast solution.
+
+    Larger LK windows/iteration counts can over-fit flicker, emissive changes and
+    generative micro-detail.  Refinement is therefore accepted only where it
+    materially improves source correspondence *and* stays reasonably close to
+    the fast trajectory.  This turns `balanced`/`quality` into conservative
+    refinements instead of independent flow fields that may jump between
+    visually similar bright structures.
+    """
+    err_base = _flow_photo_error(target, source, base_flow)
+    err_ref = _flow_photo_error(target, source, refined_flow)
+
+    # Require a real improvement, not tiny numerical noise.  The scale is in
+    # normalized luma space (0..1).
+    improvement = (err_base - err_ref - 0.0025).clamp_min(0.0)
+    improve_weight = (improvement / 0.035).clamp(0.0, 1.0)
+
+    delta = refined_flow - base_flow
+    disagreement = torch.sqrt((delta * delta).sum(dim=1, keepdim=True) + 1e-8)
+    # Allow modest sub-pixel/local refinement, reject large trajectory changes.
+    agreement_weight = (1.0 - ((disagreement - 0.50) / 3.00).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+
+    # Large local brightness changes violate LK brightness constancy.  They are
+    # exactly where torches/glows were getting a "confident" but wrong vector.
+    volatile = ((torch.maximum(err_base, err_ref) - 0.035) / 0.18).clamp(0.0, 1.0)
+
+    weight = improve_weight * agreement_weight * refined_conf.clamp(0.0, 1.0) * (1.0 - 0.75 * volatile)
+    weight = weight.clamp(0.0, 1.0)
+
+    flow = base_flow + delta * weight
+    conf = ((1.0 - weight) * base_conf + weight * refined_conf).clamp(0.0, 1.0)
+    # Confidence must reflect the same conditions that decide whether refinement
+    # is trustworthy; structure-tensor confidence alone is misleading on glow.
+    conf = conf * (1.0 - 0.65 * volatile) * (0.40 + 0.60 * agreement_weight)
+
+    stats = {
+        "refine_accept_mean": float(weight.mean().item()),
+        "refine_disagreement_mean": float(disagreement.mean().item()),
+        "refine_volatile_mean": float(volatile.mean().item()),
+        "base_photo_error_mean": float(err_base.mean().item()),
+        "refined_photo_error_mean": float(err_ref.mean().item()),
+    }
+    return flow, conf.clamp(0.0, 1.0), stats
+
+
+def _mfg_safe_confidence(target: torch.Tensor, source: torch.Tensor, flow: torch.Tensor, conf: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+    """Down-weight confidence where even the stable fast flow violates brightness constancy."""
+    err = _flow_photo_error(target, source, flow)
+    volatile = ((err - 0.035) / 0.18).clamp(0.0, 1.0)
+    safe_conf = conf.clamp(0.0, 1.0) * (1.0 - 0.80 * volatile)
+    return safe_conf.clamp(0.0, 1.0), {
+        "mfg_safe_photo_error_mean": float(err.mean().item()),
+        "mfg_safe_volatile_mean": float(volatile.mean().item()),
+    }
+
 
 def analyze_motion(
     images_bhwc: torch.Tensor,
@@ -163,11 +234,16 @@ def analyze_motion(
 
     presets={
         "fast":dict(levels=3,iterations=2,window=5),
+        "mfg_safe":dict(levels=3,iterations=2,window=5),
         "balanced":dict(levels=4,iterations=3,window=7),
         "quality":dict(levels=5,iterations=5,window=9),
     }
+    if quality not in presets:
+        raise ValueError(f"Unknown motion quality preset: {quality}")
     dev=_device(cuda_device)
     prev=_frame_luma(images_bhwc[0],dev,ah,aw)
+    refinement_stats=[]
+    console_progress = ConsoleProgress(f"Motion Analysis / {quality}", n-1, unit="pair")
 
     for i in range(n-1):
         curr=_frame_luma(images_bhwc[i+1],dev,ah,aw)
@@ -178,14 +254,31 @@ def analyze_motion(
             if cut and reset_on_scene_cut:
                 f=torch.zeros((1,2,ah,aw),device=dev)
                 c=torch.zeros((1,1,ah,aw),device=dev)
+                pair_stats={"scene_cut_reset":1.0}
             else:
-                f,c=dense_lk_flow(curr,prev,**presets[quality])
+                # `fast` is the stable anchor for every mode.  Higher presets
+                # may refine it, but are never allowed to replace it wholesale.
+                f_fast,c_fast=dense_lk_flow(curr,prev,**presets["fast"])
+                if quality == "fast":
+                    f,c=f_fast,c_fast
+                    pair_stats={"fast_anchor_only":1.0}
+                elif quality == "mfg_safe":
+                    f=f_fast
+                    c,pair_stats=_mfg_safe_confidence(curr,prev,f_fast,c_fast)
+                    del c_fast
+                else:
+                    f_ref,c_ref=dense_lk_flow(curr,prev,**presets[quality])
+                    f,c,pair_stats=_robust_refine_flow(curr,prev,f_fast,c_fast,f_ref,c_ref)
+                    del f_ref,c_ref,c_fast
+                refinement_stats.append(pair_stats)
             flows[i].copy_(f[0].permute(1,2,0).to("cpu",dtype=dtype))
             confs[i].copy_(c[0].permute(1,2,0).to("cpu",dtype=dtype))
             del f,c
         del prev
         prev=curr
+        console_progress.update(1)
     del prev
+    console_progress.close(status="done")
 
     target=images_bhwc.device if output_device=="same_as_input" else torch.device("cpu")
     if target.type!="cpu":
@@ -205,6 +298,9 @@ def analyze_motion(
             "confidence_storage_mb":round(confs.numel()*confs.element_size()/1024**2,1),
             "streaming_pairwise":True,
             "cuda_full_batch_copy":False,
+            "quality_semantics":"fast_anchor_with_robust_refinement" if quality in ("balanced","quality") else quality,
+            "mfg_safe":quality=="mfg_safe",
+            "refinement_pair_stats":refinement_stats,
             "direction":"current_to_previous",
         }
     )
